@@ -1,0 +1,28 @@
+{
+  "name": "apato-plugins",
+  "owner": {
+    "name": "apato",
+    "email": "apato@legalzoom.com"
+  },
+  "metadata": {
+    "description": "Personal Claude Code plugins",
+    "pluginRoot": "./plugins"
+  },
+  "plugins": [
+    {
+      "name": "rubber-ducky",
+      "source": "./plugins/rubber-ducky",
+      "description": "Socratic problem-solving companion. Think through problems conversationally before jumping to solutions — then hand off to plan mode.",
+      "category": "productivity",
+      "keywords": [
+        "problem-solving",
+        "socratic",
+        "rubber-duck",
+        "debugging",
+        "decision-making",
+        "analysis",
+        "adr"
+      ]
+    }
+  ]
+}
