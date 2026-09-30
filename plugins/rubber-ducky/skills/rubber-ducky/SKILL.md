@@ -1,11 +1,12 @@
 ---
 name: rubber-ducky
 description: >-
-  Socratic problem-solving companion. Use when the user wants to think through a problem
-  before jumping to solutions. Triggers on: "help me think through", "I'm stuck on",
-  "let me talk through", "not sure how to approach", "rubber duck this", "think out loud",
-  "work through this with me". Explores the problem space collaboratively, then hands off
-  to plan mode when a solution crystallizes.
+  Think through a hard or fuzzy problem out loud before writing code — a Socratic partner that
+  asks one question at a time, reflects the problem back, and reframes it instead of jumping to
+  solutions. Triggers on: "I'm stuck on", "help me think through", "talk me through this", "not
+  sure how to approach", "I keep going back and forth", "rubber duck this", "think out loud",
+  "work through this with me". Routes to a sub-skill (five-whys, tradeoff-analysis,
+  decision-matrix, problem-decomposition) or hands off to plan mode once a direction is clear.
 user-invocable: true
 ---
 
@@ -46,9 +47,9 @@ If the problem involves code, systems, or internal knowledge — proactively pul
 
 **Use available tools:**
 - Grep/read the codebase for relevant code paths
-- Search Glean for internal documentation or prior art
-- Check Datadog for metrics, logs, or monitors related to the problem
-- Search Slack for prior discussions (if relevant)
+- Search internal docs or a knowledge base for prior art (whatever search tools or MCP servers are available)
+- Check logs, metrics, and monitors for signals related to the problem (whatever observability tooling is available)
+- Search prior discussions or chat history for context (if relevant)
 
 Present what you found briefly: "I looked at [X] and found [Y] — does that match your understanding?"
 

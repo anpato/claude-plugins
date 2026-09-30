@@ -1,12 +1,11 @@
 ---
 name: adr
 description: >-
-  Create and manage Architecture Decision Records. Use when the user wants to
-  formalize a decision, document a technical choice, or update an existing ADR.
-  Triggers on: "write an ADR", "record this decision", "architecture decision record",
-  "document this choice", "formalize this decision", "create an ADR", "update the ADR",
-  "supersede ADR", "iterate on this ADR". When invoked after tradeoff-analysis or
-  decision-matrix, pre-populates from the decision artifacts.
+  Write or update an Architecture Decision Record capturing a technical choice, its context, and
+  consequences. Triggers on: "write an ADR", "record this decision", "architecture decision
+  record", "document this choice", "formalize this decision", "create an ADR", "update the ADR",
+  "supersede ADR". Pre-populates from tradeoff-analysis or decision-matrix artifacts when invoked
+  after them.
 user-invocable: true
 ---
 

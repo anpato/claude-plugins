@@ -1,10 +1,10 @@
 ---
 name: five-whys
 description: >-
-  Iterative root cause analysis through "what caused this?" chains. Use when the user
-  has a problem with an unclear root cause, or when rubber-ducky routes here. Works for
-  bugs, incidents, process failures, recurring issues, or any situation where the surface
-  problem isn't the real problem.
+  Trace a bug, incident, or recurring problem back to its root cause by repeatedly asking what
+  caused each step. Triggers on: "why does this keep happening", "find the root cause", "this bug
+  came back", "what is really causing this", "root cause analysis", "five whys", or a symptom
+  whose underlying cause is unclear. Also invoked when rubber-ducky routes here.
 user-invocable: true
 ---
 
@@ -29,9 +29,9 @@ Bad: "The deploy system is broken"
 Good: "The staging deploy failed at 2pm with error X in service Y"
 
 **If the problem involves systems**, proactively gather evidence:
-- Check Datadog logs/metrics for the relevant timeframe
+- Check logs and metrics for the relevant timeframe (whatever observability tooling is available)
 - Search the codebase for the error message or failing component
-- Search Glean for prior incidents with similar symptoms
+- Search internal docs or prior incidents for similar symptoms
 
 Present what you found: "Here's what I see in the logs — does this match what you observed?"
 

@@ -1,9 +1,10 @@
 ---
 name: problem-decomposition
 description: >-
-  Break big, hairy problems into manageable, ordered sub-problems. Use when the problem
-  is too large to tackle at once, rubber-ducky routes here, or the user says "this is too
-  big", "where do I even start", "I'm overwhelmed", "break this down for me".
+  Break a big, overwhelming problem into ordered, solvable sub-problems and find the first thing
+  to tackle. Triggers on: "this is too big", "where do I even start", "I'm overwhelmed", "break
+  this down", "too many moving parts", "how do I sequence this". Also invoked when rubber-ducky
+  routes here.
 user-invocable: true
 ---
 
@@ -38,7 +39,7 @@ Keep decomposing until each sub-problem is:
 
 **Use tools to inform decomposition:**
 - Read the codebase to understand component boundaries
-- Search Glean for existing plans or prior decompositions of similar problems
+- Search internal docs or a knowledge base for existing plans or prior decompositions of similar problems
 - Check for natural seams in the system architecture
 
 ### Step 3: Map Dependencies

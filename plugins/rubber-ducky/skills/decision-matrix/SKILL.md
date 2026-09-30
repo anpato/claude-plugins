@@ -1,11 +1,11 @@
 ---
 name: decision-matrix
 description: >-
-  Weighted scoring for complex decisions with many factors. Use when tradeoff-analysis
-  isn't structured enough, the user needs to evaluate many options against many criteria,
-  or when the user says "help me decide", "score these options", "weighted comparison",
-  "decision matrix". More rigorous than tradeoff-analysis — use when the stakes are high
-  or the team needs an auditable decision process.
+  Score several options against weighted criteria for a high-stakes, multi-factor decision that
+  needs an auditable rationale. Triggers on: "help me decide", "score these options", "weighted
+  comparison", "decision matrix", "too many factors to compare", "rank these against criteria".
+  More rigorous than tradeoff-analysis — use when stakes are high or the team needs a defensible
+  record.
 user-invocable: true
 ---
 
@@ -61,8 +61,8 @@ For each option, score it against each criterion from 1-5:
 
 **Use evidence where possible:**
 - Check the codebase to estimate effort
-- Review Datadog metrics for performance/reliability claims
-- Search Glean for team capability or prior experience data
+- Review logs and metrics for performance/reliability claims
+- Search internal docs or a knowledge base for team capability or prior experience data
 
 Present one option at a time:
 > "Let's score [Option A]. For [Criterion 1: Cost], how would you rate it? 1 = very expensive, 5 = very cheap."

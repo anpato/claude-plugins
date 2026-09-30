@@ -1,9 +1,10 @@
 ---
 name: tradeoff-analysis
 description: >-
-  Structured comparison of 2-4 approaches when multiple viable solutions exist. Use when
-  the user is choosing between approaches, rubber-ducky routes here, or the user says
-  "should I do X or Y", "what are the tradeoffs", "compare these options", "pros and cons".
+  Compare 2–4 concrete approaches side by side and lay out the tradeoffs so you can choose.
+  Triggers on: "should I do X or Y", "what are the tradeoffs", "compare these options", "pros and
+  cons", "which approach is better", "help me choose between". Presents the comparison; you make
+  the call. Also invoked when rubber-ducky routes here.
 user-invocable: true
 ---
 
@@ -47,8 +48,8 @@ For each approach, collaboratively evaluate these dimensions (skip any that don'
 
 **Use tools to ground the analysis:**
 - Search the codebase to estimate effort and identify dependencies
-- Check Glean for prior decisions or ADRs on similar topics
-- Review Datadog for performance/reliability data if relevant
+- Check internal docs or a knowledge base for prior decisions or ADRs on similar topics
+- Review logs and metrics for performance/reliability data if relevant
 
 ### Step 3: Present the Comparison
 

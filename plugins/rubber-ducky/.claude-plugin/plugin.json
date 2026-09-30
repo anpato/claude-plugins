@@ -1,6 +1,6 @@
 {
   "name": "rubber-ducky",
-  "description": "Socratic problem-solving companion. Think through problems conversationally before jumping to solutions — then hand off to plan mode.",
+  "description": "Think through a hard or fuzzy problem out loud before writing code — a Socratic partner that reflects, probes, and reframes rather than jumping to solutions.",
   "version": "1.0.0",
   "author": {
     "name": "apato",
