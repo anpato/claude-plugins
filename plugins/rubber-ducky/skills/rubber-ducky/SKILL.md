@@ -96,6 +96,7 @@ Based on what emerges from the conversation, do ONE of these:
 | Problem is too big to tackle at once | Suggest `/rubber-ducky:problem-decomposition` |
 | Complex decision with many factors | Suggest `/rubber-ducky:decision-matrix` |
 | Decision reached and user wants to formalize it | Suggest `/rubber-ducky:adr` |
+| A feature or PRD needs a design proposal with several decisions | Suggest `/rubber-ducky:rfc` |
 | Solution is clear and agreed upon | Offer handoff to plan mode |
 | User just needed to talk it out | Wrap up, offer to save |
 

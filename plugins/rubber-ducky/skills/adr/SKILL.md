@@ -28,7 +28,7 @@ Do NOT auto-fill a template. When standalone, guide the user through each sectio
 
 ### Step 1: Detect Context
 
-Check whether the skill was invoked after another rubber-ducky sub-skill. If artifacts exist from a recent tradeoff-analysis or decision-matrix session in the conversation context, offer to pre-populate:
+Check whether the skill was invoked after another rubber-ducky sub-skill. If it came from an RFC (`/rubber-ducky:rfc`), pre-populate from that decision's block: its Options, Rationale, and Implications & Mitigations map directly onto the ADR's sections, and the RFC's Current State and the section's Design become the Context. If artifacts exist from a recent tradeoff-analysis or decision-matrix session in the conversation context, offer to pre-populate:
 
 > "I see we just worked through a [tradeoff analysis / decision matrix] on [topic]. Want me to use that as the starting point for this ADR, or are you documenting a different decision?"
 
@@ -153,6 +153,7 @@ If superseding another ADR, also update the old ADR's status line to `Superseded
 | Signal | Action |
 |--------|--------|
 | Decision needs implementation | "Want me to switch to plan mode to implement this decision?" |
+| Decision is one of several in a larger feature | "This looks like part of a bigger design. Want an RFC that collects the related decisions? (`/rubber-ducky:rfc`)" |
 | Decision needs team review | "This is marked as Proposed. Share it with the team — when it's accepted, run `/rubber-ducky:adr` to update the status." |
 | More decisions to document | "Want to write another ADR, or keep thinking through related decisions?" (invoke `/rubber-ducky:rubber-ducky`) |
 

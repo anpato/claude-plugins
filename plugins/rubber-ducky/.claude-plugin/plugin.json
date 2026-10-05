@@ -1,7 +1,7 @@
 {
   "name": "rubber-ducky",
   "description": "Think through a hard or fuzzy problem out loud before writing code — a Socratic partner that reflects, probes, and reframes rather than jumping to solutions.",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": {
     "name": "apato",
     "email": "apato@legalzoom.com"
@@ -13,6 +13,7 @@
     "rubber-duck",
     "debugging",
     "decision-making",
-    "analysis"
+    "analysis",
+    "rfc"
   ]
 }
