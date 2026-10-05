@@ -12,6 +12,7 @@ A Socratic problem-solving companion for Claude Code. Think through problems con
 | **Problem Decomposition** | `/rubber-ducky:problem-decomposition` | Break big problems into ordered, solvable pieces. |
 | **Decision Matrix** | `/rubber-ducky:decision-matrix` | Weighted scoring for complex multi-criteria decisions. |
 | **ADR** | `/rubber-ducky:adr` | Create and manage Architecture Decision Records. |
+| **RFC** | `/rubber-ducky:rfc` | Turn a PRD or problem into a reviewable design proposal, with an ADR-style decision block for each real choice. |
 
 ## How It Works
 
@@ -36,3 +37,4 @@ Skills optionally save their output to `docs/rubber-ducky/` for future reference
 - Dependency maps (problem-decomposition)
 - Scored matrices (decision-matrix)
 - Architecture Decision Records (adr) → stored in `docs/adr/`
+- RFCs (rfc) → stored where the repo keeps them (e.g. `docs/*-rfc.md` or `docs/rfcs/`)
