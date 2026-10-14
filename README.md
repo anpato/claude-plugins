@@ -10,6 +10,7 @@ lives under [`plugins/`](./plugins) and is registered in
 |--------|--------------|
 | [`rubber-ducky`](./plugins/rubber-ducky) | Socratic problem-solving companion — think a problem through before writing code, with sub-skills for root-cause, tradeoffs, decomposition, decision matrices, and ADRs. |
 | [`adversary`](./plugins/adversary) | Adversarial reviewer and red-teamer — attack a PR/diff (`adversarial-review`) or pre-mortem a design before building it (`red-team-build`). |
+| [`squad`](./plugins/squad) | Live panel of your subagents as tiny animated vehicles — what each is doing, model, steps, context and time (`/squad`). |
 
 See each plugin's own README for its skills and triggers.
 
@@ -24,6 +25,7 @@ claude plugin marketplace add /Users/andrepato/projects/claude-plugins
 # Install plugins (marketplace name is "apato-plugins")
 claude plugin install rubber-ducky@apato-plugins
 claude plugin install adversary@apato-plugins
+claude plugin install squad@apato-plugins
 ```
 
 The same actions are available in-session via `/plugin`. Confirm what's registered with
