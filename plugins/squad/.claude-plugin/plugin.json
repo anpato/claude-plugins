@@ -1,0 +1,33 @@
+{
+  "name": "squad",
+  "description": "A live panel of this session's subagents as tiny vehicles: what each is doing, its model, effort, steps, context, tokens and time, with an activity bar and a one-line band above the prompt. /squad opens it.",
+  "version": "1.0.0",
+  "author": {
+    "name": "apato",
+    "email": "apato@legalzoom.com"
+  },
+  "license": "MIT",
+  "keywords": [
+    "agents",
+    "subagents",
+    "panel",
+    "mod",
+    "progress",
+    "ghostty"
+  ],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "autoOpen": {
+      "type": "boolean",
+      "title": "Open the panel when a subagent starts",
+      "description": "Opens it whenever an agent starts and it is not already open; /squad opens it by hand",
+      "default": true
+    },
+    "askForSteps": {
+      "type": "boolean",
+      "title": "Ask subagents to report their steps",
+      "description": "Adds one line to each subagent's prompt asking it to call the squad step tool, so each row shows how far through its plan it is",
+      "default": true
+    }
+  }
+}

@@ -39,6 +39,19 @@
         "bugs",
         "pull-request"
       ]
+    },
+    {
+      "name": "squad",
+      "source": "./plugins/squad",
+      "description": "A live panel of your subagents as tiny animated vehicles: what each is doing, its model, effort, steps, context, tokens and time. Real images in Ghostty/kitty, block pixels elsewhere. /squad opens it.",
+      "category": "productivity",
+      "keywords": [
+        "agents",
+        "subagents",
+        "panel",
+        "mod",
+        "ghostty"
+      ]
     }
   ]
 }
