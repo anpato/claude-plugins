@@ -19,8 +19,8 @@ See each plugin's own README for its skills and triggers.
 Add this repo as a marketplace (once), then install the plugins you want:
 
 ```bash
-# Register this directory as a marketplace
-claude plugin marketplace add /Users/andrepato/projects/claude-plugins
+# Register the GitHub repo as a marketplace
+claude plugin marketplace add anpato/claude-plugins
 
 # Install plugins (marketplace name is "apato-plugins")
 claude plugin install rubber-ducky@apato-plugins
@@ -31,10 +31,20 @@ claude plugin install squad@apato-plugins
 The same actions are available in-session via `/plugin`. Confirm what's registered with
 `claude plugin marketplace list` and `claude plugin list`.
 
+Installs track the `main` branch on GitHub. Run `claude plugin marketplace update apato-plugins`
+to pick up newly pushed changes.
+
 ## Developing locally
 
-This is a **local-directory marketplace**, so its plugins load **in place** from this source tree —
-they are not copied into a cache. That makes the edit/test loop short:
+To work on the plugins, register your clone as a **local-directory marketplace** instead of the
+GitHub repo (remove the GitHub one first if you added it — both use the name `apato-plugins`):
+
+```bash
+claude plugin marketplace add /path/to/your/clone/claude-plugins
+```
+
+Plugins then load **in place** from the source tree — they are not copied into a cache. That makes
+the edit/test loop short:
 
 1. Edit a plugin's files (e.g. a `SKILL.md`).
 2. Apply the change: run `/reload-plugins` in a session, or start a new session.

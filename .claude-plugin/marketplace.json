@@ -1,8 +1,8 @@
 {
   "name": "apato-plugins",
   "owner": {
-    "name": "apato",
-    "email": "apato@legalzoom.com"
+    "name": "anpato",
+    "url": "https://github.com/anpato"
   },
   "metadata": {
     "description": "Personal Claude Code plugins",

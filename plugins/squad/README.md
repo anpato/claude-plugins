@@ -40,8 +40,9 @@ how many are running.
 
 ## Install
 
-```
-/plugin install squad --marketplace anpato/claude-plugins
+```bash
+claude plugin marketplace add anpato/claude-plugins
+claude plugin install squad@apato-plugins
 ```
 
 Mods are an early-access Claude Code feature, and their API can change between releases.
