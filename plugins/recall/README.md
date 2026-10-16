@@ -5,11 +5,38 @@ Pull a past Claude Code session from **any directory** into the conversation you
 loads a condensed **digest** of the session you pick: its prompts, Claude's replies, the files it
 edited and its PRs. Your current session keeps going.
 
-## Skills
+## The pane: `/recall`
+
+```
+/recall                      # open the pane with your 30 most recent sessions, all projects
+/recall webhook retries      # open it on a full-text search
+/recall p:harness routing    # p:<substring> filters by project path
+```
+
+```
+┌ Recall ───────────────────────────────────────────────┐
+│ search all sessions · p:<project> to filter · Enter    │
+│ 30 recent sessions · 1-9 or click to pick              │
+│ 1: kiln-auto-mixed-stacks-testing                      │
+│    ~/projects/harness [kiln-mods] · 2m ago             │
+│ 2: 3D modeling for 3D printing                         │
+│    ~/projects · 18m ago                                │
+└────────────────────────────────────────────────────────┘
+```
+
+- Type in the search box and press Enter to search every project. An empty search lists recent sessions again.
+- Press `1`–`9`, or click a row, to open a session. You'll see its project, branch, age, last prompt, any search snippets and its PRs.
+- Then press:
+  - `l` (**load into chat**) to append the session's digest to this conversation, as context the model reads. A `✓` marks sessions you've loaded.
+  - `c` to copy the command that resumes the session itself.
+  - `b` to go back to the list.
+- Esc returns to the prompt.
+
+## The skill: `/recall:recall`
 
 | Skill | Command | Purpose |
 |-------|---------|---------|
-| **Recall** | `/recall:recall [query \| --project <path> \| <session-id>]` | Find a past session and load its digest as context. |
+| **Recall** | `/recall:recall [query \| --project <path> \| <session-id>]` | The model finds a past session and loads its digest. Also triggers on plain requests. |
 
 ```
 /recall:recall                         # 10 most recent sessions, all projects
@@ -23,6 +50,11 @@ It also triggers on phrases like "pull in my session from the other project" or 
 conversation where I set up X".
 
 ## How it works
+
+The pane is a mod (`hooks/register.tsx`, a function-hooks module like squad's). It runs
+`scripts/recall.py` with `--json` through `$.process.run`, and loads a digest with
+`$.session.append`. That adds a user-role row the model reads, framed as a record of past work
+and not as instructions, plus a visible notice row. The skill calls the same script through Bash.
 
 `scripts/recall.py` is a stdlib-only Python 3 script and is read-only. It scans
 `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`, or `$CLAUDE_CONFIG_DIR/projects` if that is set.
@@ -58,7 +90,8 @@ claude plugin install recall@apato-plugins
 ## Develop
 
 ```bash
-python3 -I -m unittest discover -s plugins/recall/tests
-python3 plugins/recall/scripts/recall.py list --limit 5
+python3 -I -m unittest discover -s plugins/recall/tests   # the script
+claude plugin test plugins/recall                          # the pane (hooks/register.test.ts)
+python3 plugins/recall/scripts/recall.py list --limit 5 [--json]
 claude plugin validate plugins/recall
 ```

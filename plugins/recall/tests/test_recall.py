@@ -100,6 +100,30 @@ class RecallTest(unittest.TestCase):
         self.assertNotIn("Old title", out)
         self.assertIn("/work/my-app [main]", out)
 
+    def test_list_json_shape(self):
+        rows = json.loads(self.run_cli("list", "--json"))
+        self.assertEqual([r["id"] for r in rows], [SID_B, SID_A])
+        a = rows[1]
+        self.assertEqual(a["title"], "Webhook retries")
+        self.assertEqual(a["cwd"], "/work/my-app")
+        self.assertEqual(a["branch"], "main")
+        self.assertEqual(a["prs"], ["https://github.com/x/y/pull/7"])
+        hits = json.loads(self.run_cli("search", "backoff", "--json"))
+        self.assertEqual(hits[0]["id"], SID_A)
+        self.assertGreater(hits[0]["hits"], 0)
+        self.assertTrue(hits[0]["snippets"])
+
+    def test_shell_escape_prompts_never_become_titles(self):
+        sid = "eeeeeeee-5555-4555-8555-555555555555"
+        self.write(Path(os.environ["CLAUDE_CONFIG_DIR"]) / "projects/-work-sh" / f"{sid}.jsonl", [
+            {"type": "last-prompt", "lastPrompt": "! TOKEN=secret do-thing", "sessionId": sid},
+            user("! TOKEN=secret do-thing", "2026-10-05T00:00:00Z", "/work/sh"),
+            user("real question", "2026-10-05T00:00:01Z", "/work/sh"),
+        ])
+        out = self.run_cli("list", "--project", "/work/sh")
+        self.assertIn("real question", out)
+        self.assertNotIn("TOKEN=secret", out)
+
     def test_list_project_filter_uses_real_cwd(self):
         out = self.run_cli("list", "--project", "my-app")
         self.assertIn(SID_A, out)

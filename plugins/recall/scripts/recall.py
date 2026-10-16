@@ -177,12 +177,13 @@ def summarize(path):
         elif t == "ai-title" and rec.get("aiTitle"):
             info["ai_title"] = rec["aiTitle"]
         elif t == "last-prompt" and rec.get("lastPrompt"):
-            info["last_prompt"] = rec["lastPrompt"]
+            # Shell escapes ("! cmd") make poor titles and may carry secrets.
+            if not rec["lastPrompt"].startswith("!"):
+                info["last_prompt"] = rec["lastPrompt"]
         elif t == "pr-link" and rec.get("prUrl") and rec["prUrl"] not in info["prs"]:
             info["prs"].append(rec["prUrl"])
         elif info["first_prompt"] is None:
             prompt = user_prompt(rec)
-            # Shell escapes ("! cmd") make poor titles and may carry secrets.
             if prompt and not prompt.startswith("!"):
                 info["first_prompt"] = prompt
     info["title"] = info["title"] or info["ai_title"] or one_line(info["first_prompt"] or info["last_prompt"] or "(untitled)", 60)
@@ -231,8 +232,29 @@ def print_row(n, s, extra=None):
         print(f"   > {line}")
 
 
+def as_json(s, hits=None, snippets=None):
+    row = {
+        "id": s["id"],
+        "title": s["title"],
+        "cwd": s["cwd"],
+        "project": short_cwd(s["cwd"]),
+        "branch": s["branch"] if s["branch"] != "HEAD" else None,
+        "lastActive": s["last_ts"].isoformat(),
+        "age": age(s["last_ts"]),
+        "lastPrompt": s["last_prompt"],
+        "prs": s["prs"],
+    }
+    if hits is not None:
+        row["hits"] = hits
+        row["snippets"] = snippets
+    return row
+
+
 def cmd_list(args):
     sessions = collect(args)[: args.limit]
+    if args.json:
+        print(json.dumps([as_json(s) for s in sessions]))
+        return
     if not sessions:
         print("No sessions found.")
         return
@@ -305,6 +327,9 @@ def cmd_search(args):
         if hits or bonus:
             ranked.append((bonus + hits, hits, s, snippets))
     ranked.sort(key=lambda r: (r[0], r[2]["last_ts"]), reverse=True)
+    if args.json:
+        print(json.dumps([as_json(s, hits, snippets) for _, hits, s, snippets in ranked[: args.limit]]))
+        return
     if not ranked:
         print(f"No sessions mention {args.query!r}.")
         return
@@ -445,6 +470,7 @@ def main(argv=None):
         p.add_argument("--project", help="substring of the session's working directory")
         p.add_argument("--limit", type=int, default=limit)
         p.add_argument("--include-tmp", action="store_true", help="include sessions from temp/scratch dirs")
+        p.add_argument("--json", action="store_true", help="machine-readable output")
         p.add_argument("--exclude", help="session id to leave out (default: $CLAUDE_CODE_SESSION_ID)")
 
     common(sub.add_parser("list", help="recent sessions across all projects"), 20)
