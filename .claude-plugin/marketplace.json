@@ -52,6 +52,20 @@
         "mod",
         "ghostty"
       ]
+    },
+    {
+      "name": "recall",
+      "source": "./plugins/recall",
+      "description": "Pull a past Claude Code session from any directory into the current one: list, search, or filter sessions across all projects and load a condensed digest as context.",
+      "category": "productivity",
+      "keywords": [
+        "sessions",
+        "history",
+        "context",
+        "resume",
+        "search",
+        "transcripts"
+      ]
     }
   ]
 }

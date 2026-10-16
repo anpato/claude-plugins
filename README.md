@@ -11,6 +11,7 @@ lives under [`plugins/`](./plugins) and is registered in
 | [`rubber-ducky`](./plugins/rubber-ducky) | Socratic problem-solving companion — think a problem through before writing code, with sub-skills for root-cause, tradeoffs, decomposition, decision matrices, and ADRs. |
 | [`adversary`](./plugins/adversary) | Adversarial reviewer and red-teamer — attack a PR/diff (`adversarial-review`) or pre-mortem a design before building it (`red-team-build`). |
 | [`squad`](./plugins/squad) | Live panel of your subagents as tiny animated vehicles — what each is doing, model, steps, context and time (`/squad`). |
+| [`recall`](./plugins/recall) | Pull a past session from any directory into the current one — list, search or filter sessions across all projects and load a digest as context (`/recall:recall`). |
 
 See each plugin's own README for its skills and triggers.
 
@@ -26,6 +27,7 @@ claude plugin marketplace add anpato/claude-plugins
 claude plugin install rubber-ducky@apato-plugins
 claude plugin install adversary@apato-plugins
 claude plugin install squad@apato-plugins
+claude plugin install recall@apato-plugins
 ```
 
 The same actions are available in-session via `/plugin`. Confirm what's registered with

@@ -1,0 +1,10 @@
+{
+  "name": "recall",
+  "description": "Pull a past Claude Code session from any directory into the current one: list, search, or filter sessions across all projects and load a condensed digest as context.",
+  "version": "1.0.0",
+  "author": {
+    "name": "apato"
+  },
+  "license": "MIT",
+  "keywords": ["sessions", "history", "context", "resume", "search", "transcripts"]
+}
