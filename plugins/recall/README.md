@@ -32,18 +32,18 @@ edited and its PRs. Your current session keeps going.
   - `b` to go back to the list.
 - Esc returns to the prompt.
 
-## The skill: `/recall:recall`
+## The skill: `/recall:find-session`
 
 | Skill | Command | Purpose |
 |-------|---------|---------|
-| **Recall** | `/recall:recall [query \| --project <path> \| <session-id>]` | The model finds a past session and loads its digest. Also triggers on plain requests. |
+| **Recall** | `/recall:find-session [query \| --project <path> \| <session-id>]` | The model finds a past session and loads its digest. Also triggers on plain requests. |
 
 ```
-/recall:recall                         # 10 most recent sessions, all projects
-/recall:recall webhook retries         # full-text search of prompts and replies
-/recall:recall --project harness       # sessions whose working dir contains "harness"
-/recall:recall --project kiln routing  # search within one project
-/recall:recall 699fb874                # load a session by id or id prefix
+/recall:find-session                         # 10 most recent sessions, all projects
+/recall:find-session webhook retries         # full-text search of prompts and replies
+/recall:find-session --project harness       # sessions whose working dir contains "harness"
+/recall:find-session --project kiln routing  # search within one project
+/recall:find-session 699fb874                # load a session by id or id prefix
 ```
 
 It also triggers on phrases like "pull in my session from the other project" or "find the

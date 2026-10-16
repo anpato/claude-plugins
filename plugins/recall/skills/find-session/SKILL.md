@@ -1,5 +1,5 @@
 ---
-name: recall
+name: find-session
 description: >-
   Pull a past Claude Code session from any directory into this conversation: list recent sessions
   across every project, search them by keyword, filter by project path, or load one by session id,
