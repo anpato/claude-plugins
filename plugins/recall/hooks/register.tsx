@@ -31,6 +31,23 @@ export const parseQuery = (raw: string) => {
   return { project, text: words.join(' ') }
 }
 
+// Moves the keyboard ring to an element of the pane. The tree that draws it may
+// land a moment after the state write, so one miss is retried.
+// Best effort: a focus that does not move never fails what asked for it.
+const focusOn = async ($: EngineInterface, key: string) => {
+  try {
+    for (let tries = 0; tries < 2; tries++) {
+      const moved = await $.ui.focus({ requestId: PANE, key })
+      if (!('reason' in moved) || moved.reason === undefined) return
+      await $.clock.sleep(60)
+    }
+  } catch {
+    // No surface to focus on (headless, tests): the person can still Tab.
+  }
+}
+
+const rowKey = (id: string) => `s-${id}`
+
 const script = ($: EngineInterface) => `${$.plugin.root}/scripts/recall.py`
 
 const runScript = async ($: EngineInterface, args: string[], timeoutMs = 30_000) => {
@@ -56,6 +73,8 @@ const lookup = async ($: EngineInterface, raw: string) => {
         ? `Nothing mentions "${text}"${scope}`
         : `No sessions${scope}`
     await patch($, () => ({ sessions, status, isBusy: false }))
+    // Digits and arrows then pick rows instead of typing into the search box.
+    if (sessions[0]) await focusOn($, rowKey(sessions[0].id))
   } catch (err) {
     await patch($, () => ({ sessions: [], isBusy: false, status: `Failed: ${err instanceof Error ? err.message : String(err)}` }))
   }
@@ -113,7 +132,7 @@ export const register: Register = on => {
         key="query"
         placeholder="search all sessions · p:<project> to filter · Enter"
         value={v.query}
-        autoFocus={picked ? undefined : true}
+        autoFocus={picked || v.sessions.length ? undefined : true}
         onSubmit={value => void lookup($, value)}
       />
     ) : null
@@ -133,25 +152,33 @@ export const register: Register = on => {
             <Text dimColor wrap="wrap">{`> ${fit(oneLine(snippet), width * 3)}`}</Text>
           ))}
           {picked.prs.map(pr => <Text dimColor wrap="truncate">{pr}</Text>)}
-          <Box marginTop={1} gap={1} flexWrap="wrap">
+          <Box marginTop={1} gap={1} flexShrink={0}>
             <Button
               key="load"
               hotkey="l"
               variant="primary"
               autoFocus
-              label={isLoaded ? 'load again' : 'load into chat'}
+              label={isLoaded ? 'l load again' : 'l load into chat'}
               onPress={() => void loadDigest($, picked)}
             />
             <Button
               key="copy"
               hotkey="c"
-              label="copy resume cmd"
+              label="c copy resume cmd"
               onPress={async press => {
                 const copied = await $.ui.copy({ text: resume, surface: press.surface })
                 $.ui.toast(copied.isCopied ? 'Resume command copied.' : resume)
               }}
             />
-            <Button key="back" hotkey="b" label="back" onPress={() => void patch($, () => ({ pickedId: null }))} />
+            <Button
+              key="back"
+              hotkey="b"
+              label="b back"
+              onPress={async () => {
+                await patch($, () => ({ pickedId: null }))
+                await focusOn($, rowKey(picked.id))
+              }}
+            />
           </Box>
           {v.status !== '' && <Text dimColor wrap="truncate">{v.status}</Text>}
         </Box>
@@ -161,23 +188,35 @@ export const register: Register = on => {
     const room = Math.max(3, Math.floor((e.props.scroll.bodyRows - 4) / 2))
     return (
       <Box flexDirection="column" paddingX={1}>
-        {search}
-        <Text dimColor wrap="truncate">
-          {v.isBusy ? v.status : `${v.status}${v.sessions.length ? ' · 1-9 or click to pick' : ''}`}
-        </Text>
+        {search && <Box flexShrink={0} marginBottom={1}>{search}</Box>}
+        <Box flexShrink={0} gap={1}>
+          <Text dimColor wrap="truncate">
+            {v.isBusy ? v.status : `${v.status}${v.sessions.length ? ' · 1-9 pick' : ''}`}
+          </Text>
+          {Input && v.sessions.length > 0 && (
+            <Button key="to-search" plain dimColor hotkey="s" label="search" onPress={() => void focusOn($, 'query')} />
+          )}
+        </Box>
+        {/* One row per line: a Button is a single terminal row, so the meta line sits under it. */}
         {v.sessions.slice(0, Math.max(room, 9)).map((s, i) => (
-          <Button
-            key={`s-${s.id}`}
-            plain
-            hotkey={i < 9 ? String(i + 1) : undefined}
-            onPress={() => void patch($, () => ({ pickedId: s.id }))}
-          >
-            {fit(oneLine(s.title), width - 3)}
-            {'\n'}
-            <Text dimColor>
-              {fit(`${v.loadedIds.includes(s.id) ? '✓ ' : ''}${s.project}${s.branch ? ` [${s.branch}]` : ''} · ${s.age}${s.hits ? ` · ${s.hits} hits` : ''}`, width - 3)}
-            </Text>
-          </Button>
+          <Box key={`row-${s.id}`} flexDirection="column" flexShrink={0}>
+            <Button
+              key={rowKey(s.id)}
+              plain
+              autoFocus={i === 0 ? true : undefined}
+              hotkey={i < 9 ? String(i + 1) : undefined}
+              label={fit(oneLine(s.title), width - 3)}
+              onPress={async () => {
+                await patch($, () => ({ pickedId: s.id }))
+                await focusOn($, 'load')
+              }}
+            />
+            <Box paddingLeft={3}>
+              <Text dimColor wrap="truncate">
+                {fit(`${v.loadedIds.includes(s.id) ? '✓ ' : ''}${s.project}${s.branch ? ` [${s.branch}]` : ''} · ${s.age}${s.hits ? ` · ${s.hits} hits` : ''}`, width - 3)}
+              </Text>
+            </Box>
+          </Box>
         ))}
       </Box>
     )

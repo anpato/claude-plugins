@@ -16,7 +16,7 @@ edited and its PRs. Your current session keeps going.
 ```
 ┌ Recall ───────────────────────────────────────────────┐
 │ search all sessions · p:<project> to filter · Enter    │
-│ 30 recent sessions · 1-9 or click to pick              │
+│ 30 recent sessions · 1-9 pick s: search                │
 │ 1: kiln-auto-mixed-stacks-testing                      │
 │    ~/projects/harness [kiln-mods] · 2m ago             │
 │ 2: 3D modeling for 3D printing                         │
@@ -24,9 +24,10 @@ edited and its PRs. Your current session keeps going.
 └────────────────────────────────────────────────────────┘
 ```
 
-- Type in the search box and press Enter to search every project. An empty search lists recent sessions again.
-- Press `1`–`9`, or click a row, to open a session. You'll see its project, branch, age, last prompt, any search snippets and its PRs.
-- Then press:
+- The pane opens with the keyboard. Once results load, the first row has focus.
+- Press `1`–`9`, or click a row, to open a session. Arrows and Tab move between rows too. The session view shows its project, branch, age, last prompt, any search snippets and its PRs.
+- Press `s` to jump to the search box, type, and press Enter to search every project. An empty search lists recent sessions again.
+- In a session's view, press:
   - `l` (**load into chat**) to append the session's digest to this conversation, as context the model reads. A `✓` marks sessions you've loaded.
   - `c` to copy the command that resumes the session itself.
   - `b` to go back to the list.
