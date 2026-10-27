@@ -36,6 +36,13 @@ const openable = atom({ plugin: 'squad', key: 'openable' } as const, [])
 const contextWindow = atom({ plugin: 'squad', key: 'contextWindow' } as const, 0)
 const isFinishedCollapsed = atom({ plugin: 'squad', key: 'isFinishedCollapsed' } as const, false)
 const hasPixels = atom({ plugin: 'squad', key: 'hasPixels' } as const, false)
+// Offload runs read from disk, shown as rows beside the subagents.
+const offloadRuns = atom({ plugin: 'squad', key: 'offloadRuns' } as const, [])
+
+const DEFAULT_STALL_AFTER_SEC = 120
+const STALL_COLOR = '#e5c07b'
+const OFFLOAD_POLL_MS = 5000
+const OFFLOAD_RUNS_DIR = '.cache/offload/runs'
 
 // A finished agent's row is dropped this long after it ended.
 const FINISHED_ROW_TTL_MS = 60 * 60 * 1000
@@ -124,17 +131,92 @@ const sweepPulse = (width: number, step: number): { from: number; levels: number
   return { from, levels }
 }
 
+// A positive number of seconds from a setting, else the default.
+const stallAfterMs = (value: unknown): number =>
+  (typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : DEFAULT_STALL_AFTER_SEC) * 1000
+
+// A running subagent that has made no tool call or model request for too long.
+// Offload runs report no activity, so they are never flagged.
+const isIdle = (a: SquadAgent, now: number, limitMs: number): boolean =>
+  a.status === 'running' && a.type !== 'offload' && now - (a.lastActivityAt ?? a.startedAt) > limitMs
+
+const idleLabel = (a: SquadAgent, now: number): string => {
+  const sec = Math.floor((now - (a.lastActivityAt ?? a.startedAt)) / 1000)
+  return `idle ${sec >= 60 ? `${Math.floor(sec / 60)}m` : `${sec}s`}`
+}
+
+const callsLabel = (a: SquadAgent): string =>
+  a.toolCalls === undefined ? '' : `${a.toolCalls} ${a.toolCalls === 1 ? 'call' : 'calls'}`
+
+const asText = (v: unknown): string | undefined => (typeof v === 'string' && v !== '' ? v : undefined)
+const asSeconds = (v: unknown): number | undefined => (typeof v === 'number' && Number.isFinite(v) ? v : undefined)
+
+// One offload run.json as a row, or undefined when it is malformed or too old.
+// Missing fields are unknown, never an error.
+const offloadRow = (raw: unknown, now: number): SquadAgent | undefined => {
+  if (typeof raw !== 'object' || raw === null) return undefined
+  const r = raw as Record<string, unknown>
+  const runId = asText(r.run_id)
+  const state = asText(r.status)
+  if (runId === undefined) return undefined
+  const created = asSeconds(r.created)
+  const isLive = state === 'running' || state === 'prepared'
+  const base = {
+    id: `offload:${runId}`,
+    title: asText(r.slug) ?? runId,
+    type: 'offload',
+    model: asText(r.model) ?? '',
+    usage: ZERO,
+    contextTokens: 0,
+  }
+  if (isLive) return { ...base, status: 'running', startedAt: created !== undefined ? created * 1000 : now }
+  if (state !== 'ok' && state !== 'failed' && state !== 'timeout') return undefined
+  const ended = asSeconds(r.ended_at)
+  const duration = asSeconds(r.duration_s)
+  const endedAt =
+    ended !== undefined ? ended * 1000 : created !== undefined && duration !== undefined ? (created + duration) * 1000 : undefined
+  // Without a start or an end there is no elapsed time to show or age to judge.
+  if (created === undefined || endedAt === undefined || now - endedAt > FINISHED_ROW_TTL_MS) return undefined
+  return { ...base, status: state === 'ok' ? 'done' : 'failed', startedAt: created * 1000, endedAt }
+}
+
+// Reads ~/.cache/offload/runs/*/run.json. Any failure yields no rows.
+const readOffloadRuns = async ($: EngineInterface, now: number): Promise<SquadAgent[]> => {
+  try {
+    const home = await $.env.get('HOME')
+    if (!home) return []
+    const dir = `${home}/${OFFLOAD_RUNS_DIR}`
+    if (!(await $.fs.exists(dir))) return []
+    const entries = await $.fs.list(dir)
+    const rows: SquadAgent[] = []
+    for (const entry of entries) {
+      if (entry.kind !== 'dir') continue
+      try {
+        const text = await $.fs.read(`${dir}/${entry.name}/run.json`)
+        const row = offloadRow(JSON.parse(typeof text === 'string' ? text : ''), now)
+        if (row !== undefined) rows.push(row)
+      } catch {
+        // a missing or malformed run.json skips that run only
+      }
+    }
+    return rows.sort((a, b) => a.startedAt - b.startedAt)
+  } catch {
+    return []
+  }
+}
+
 const stepsLabel = (a: SquadAgent): string => {
   if (a.stepsTotal !== undefined) {
     const done = a.status === 'done' ? a.stepsTotal : Math.min(a.stepsTotal, a.stepsDone ?? 0)
     return `${done}/${a.stepsTotal}`
   }
-  return a.status === 'running' ? '…' : ''
+  return a.status === 'running' && !a.toolCalls ? '…' : ''
 }
 
 export const register: Register = (on, options) => {
   // Whether the pane is open, refreshed once a second: the sweep only runs then.
   let isOpen = false
+  let offloadPolledAt = -Infinity
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -174,10 +256,17 @@ export const register: Register = (on, options) => {
     $.clock.every(1000, async () => {
       isOpen = await isPaneOpen($)
       if (isOpen) await refreshOpenable($)
-      const list = await read($, agents)
+      const now = await $.clock.now()
+      if (now - offloadPolledAt >= OFFLOAD_POLL_MS) {
+        offloadPolledAt = now
+        const runs = await readOffloadRuns($, now)
+        if (JSON.stringify(runs) !== JSON.stringify(await read($, offloadRuns))) {
+          await update($, offloadRuns, () => runs)
+        }
+      }
+      const list = [...(await read($, agents)), ...(await read($, offloadRuns))]
       if (list.some(a => a.status === 'running')) await update($, tick, n => n + 1)
 
-      const now = await $.clock.now()
       const isExpired = (a: SquadAgent) =>
         a.status !== 'running' && a.endedAt !== undefined && now - a.endedAt > FINISHED_ROW_TTL_MS
       if (list.some(isExpired)) await update($, agents, all => all.filter(a => !isExpired(a)))
@@ -208,7 +297,7 @@ export const register: Register = (on, options) => {
 
   on('agent.spawn', async ($, e, next) => {
     const canRewrite = e.workflow === undefined && e.resume === undefined
-    const shouldAsk = options.askForSteps !== false && canRewrite && !e.prompt.includes(STEP_TOOL)
+    const shouldAsk = options.askForSteps === true && canRewrite && !e.prompt.includes(STEP_TOOL)
     const started = await next(shouldAsk ? { ...e, prompt: e.prompt + STEP_NOTE } : e)
     if (started.deny !== undefined || started.agentId === undefined) return started
 
@@ -221,6 +310,8 @@ export const register: Register = (on, options) => {
       startedAt: await $.clock.now(),
       usage: ZERO,
       contextTokens: 0,
+      toolCalls: 0,
+      lastActivityAt: await $.clock.now(),
     }
     await update($, agents, list => [...list.filter(a => a.id !== agent.id), agent].slice(-100))
     await refreshOpenable($)
@@ -248,6 +339,8 @@ export const register: Register = (on, options) => {
     const { agentId } = e
     const reported = result.usage
     if (agentId === undefined) return result
+    const at = await $.clock.now()
+    await patchAgent($, agentId, a => ({ ...a, lastActivityAt: at }))
     if (result.toolUses.length === 0 && result.answer !== '') {
       await patchAgent($, agentId, a => withActivity(a, 'answer'))
     }
@@ -288,12 +381,14 @@ export const register: Register = (on, options) => {
 
     if (tool === STEP_TOOL) {
       if (agentId === undefined) return { result: 'ignored: only subagents report steps' }
+      const at = await $.clock.now()
       // A missing, invalid or zero total keeps the plan already reported.
       const total = toCount(input.total)
       const done = toCount(input.done)
       const note = typeof input.note === 'string' ? input.note.trim() : ''
       await patchAgent($, agentId, a => ({
         ...a,
+        lastActivityAt: at,
         stepsTotal: total !== undefined && total > 0 ? total : a.stepsTotal,
         stepsDone: done ?? a.stepsDone,
         note: note || undefined,
@@ -301,9 +396,13 @@ export const register: Register = (on, options) => {
       return { result: 'ok' }
     }
 
-    const activity = agentId === undefined ? undefined : activityOfTool(tool)
-    if (agentId !== undefined && activity !== undefined) {
-      await patchAgent($, agentId, a => withActivity(a, activity))
+    if (agentId !== undefined) {
+      const activity = activityOfTool(tool)
+      const at = await $.clock.now()
+      await patchAgent($, agentId, a => {
+        const counted = { ...a, toolCalls: (a.toolCalls ?? 0) + 1, lastActivityAt: at }
+        return activity === undefined ? counted : withActivity(counted, activity)
+      })
     }
     return next(e)
   }).catch(($, e, next) => next(e)) // never block a tool over the panel's bookkeeping
@@ -314,7 +413,8 @@ export const register: Register = (on, options) => {
     const Raster = e.surface === 'terminal' && 'Raster' in ui ? ui.Raster : undefined
     const Image = e.surface === 'terminal' && 'Image' in ui && (await read($, hasPixels)) ? ui.Image : undefined
 
-    const list = await read($, agents)
+    const list = [...(await read($, agents)), ...(await read($, offloadRuns))]
+    const stallMs = stallAfterMs(options.stallAfterSec)
     const frame = await read($, tick)
     const step = await read($, sweep)
     const window = await read($, contextWindow)
@@ -395,7 +495,8 @@ export const register: Register = (on, options) => {
             <Box flexDirection="row" justifyContent="space-between" columnGap={1}>
               {title}
               <Text>
-                <Text dimColor>{stepsLabel(a)} </Text>
+                {isIdle(a, now, stallMs) && <Text dimColor color={STALL_COLOR}>{idleLabel(a, now)} </Text>}
+                <Text dimColor>{[stepsLabel(a), callsLabel(a)].filter(Boolean).join(' · ')} </Text>
                 {mark}
               </Text>
             </Box>
@@ -446,7 +547,8 @@ export const register: Register = (on, options) => {
             </Text>
             <Box flexDirection="row" justifyContent="space-between" columnGap={1}>
               <Text wrap="truncate-end">
-                {stepsLabel(a)}
+                {[stepsLabel(a), callsLabel(a)].filter(Boolean).join(' · ')}
+                {isIdle(a, now, stallMs) && <Text dimColor color={STALL_COLOR}> {idleLabel(a, now)}</Text>}
                 {a.note !== undefined && a.status === 'running' ? <Text dimColor> {a.note}</Text> : ''}
               </Text>
               <Text dimColor>{meta}</Text>
@@ -499,6 +601,7 @@ export const register: Register = (on, options) => {
     const frame = await read($, tick)
     const now = await $.clock.now()
     const done = list.length - running.length
+    const idle = running.filter(a => isIdle(a, now, stallAfterMs(options.stallAfterSec))).length
     const span = now - Math.min(...running.map(a => a.startedAt))
 
     return (
@@ -507,6 +610,7 @@ export const register: Register = (on, options) => {
         <Text>
           squad · {running.length} running{done > 0 ? ` · ${done} done` : ''}
         </Text>
+        {idle > 0 && <Text dimColor color={STALL_COLOR}>{idle} idle</Text>}
         <Text dimColor>{formatDuration(span)}</Text>
         <Button key="open" label="open" onPress={() => openPane($)} />
       </Box>

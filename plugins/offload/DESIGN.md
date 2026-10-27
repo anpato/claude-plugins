@@ -239,6 +239,20 @@ Unicode format characters (category `Cf`, such as bidi overrides and zero-width 
 `est_cost_usd` uses a per-model price table in the script. kimi-k3 rates per 1M tokens: $3 input, $0.30 cache read,
 $15 output.
 
+### run.json (public read-only interface)
+
+`<run_dir>/run.json` is a public, read-only interface for status displays (for example the squad panel). Other
+tools may read it; they must not write it. It is written atomically (temp file in the same directory, then
+`os.replace`) with mode 0600, so a reader never sees a partial file. Fields a display can rely on:
+
+- `status`: `prepared` (set up, worker not started) -> `running` (just before `sandbox-exec` starts) -> the final
+  status from the table above.
+- `started_at`: unix seconds (float), set when the worker launches.
+- `tool_calls`: running count of `tool_use` blocks in assistant messages (0 at launch).
+- `last_activity_at`: unix seconds (float), time of the latest assistant message with a `tool_use` block.
+  Live updates are throttled to one write per 2 s, so both can lag by up to 2 s until the final write.
+- `ended_at`: unix seconds (float), set on finish with any status, together with `duration_s`.
+
 ## Base URL
 
 The default is `http://localhost:11434`. Other hosts are read only from `~/.config/offload/config.json` (`base_urls`

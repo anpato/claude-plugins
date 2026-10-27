@@ -654,10 +654,39 @@ def validate_repo(repo, ohome, git_home="/var/empty"):
 
 
 def write_run_json(run_dir, record):
+    """Atomic: temp file in the same dir (mode 0600), then os.replace. Readers never see a partial file."""
     tmp = os.path.join(run_dir, "run.json.tmp")
-    with open(tmp, "w") as f:
-        json.dump(record, f, indent=2, sort_keys=True)
-    os.replace(tmp, os.path.join(run_dir, "run.json"))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(record, f, indent=2, sort_keys=True)
+        os.chmod(tmp, 0o600)  # O_CREAT mode is ignored if a stale tmp already existed
+        os.replace(tmp, os.path.join(run_dir, "run.json"))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+RUN_JSON_MIN_INTERVAL_S = 2.0
+
+
+class Progress:
+    """Live fields of run.json: tool_calls and last_activity_at, written at most once per interval."""
+
+    def __init__(self, run_dir, record, interval=RUN_JSON_MIN_INTERVAL_S, clock=time.monotonic):
+        self.run_dir, self.record, self.interval, self.clock = run_dir, record, interval, clock
+        self.last_write = None
+
+    def tool_use(self, n):
+        self.record["tool_calls"] = self.record.get("tool_calls", 0) + n
+        self.record["last_activity_at"] = time.time()
+        now = self.clock()
+        if self.last_write is None or now - self.last_write >= self.interval:
+            self.last_write = now
+            write_run_json(self.run_dir, self.record)
 
 
 def ref_exists(repo, ref, home):
@@ -963,6 +992,7 @@ def launch_worker(ctx, brief_text, timeout_s):
            "text": "", "log_path": log_path, "survivors_killed": []}
     per_msg = {}
     buf = [b""]
+    progress = Progress(ctx["run_dir"], ctx["record"])
 
     def handle_line(raw):
         """Returns True to stop reading (init check failed)."""
@@ -980,14 +1010,21 @@ def launch_worker(ctx, brief_text, timeout_s):
             msg = ev.get("message") or {}
             if isinstance(msg.get("usage"), dict):
                 per_msg[msg.get("id") or len(per_msg)] = msg["usage"]
+            n_tools = 0
             for blk in msg.get("content") or []:
                 if isinstance(blk, dict) and blk.get("type") == "text":
                     out["text"] = blk.get("text", "")
+                elif isinstance(blk, dict) and blk.get("type") == "tool_use":
+                    n_tools += 1
+            if n_tools:
+                progress.tool_use(n_tools)
         elif ev.get("type") == "result":
             out["result"] = ev
         return False
 
     with open(log_path, "wb") as log, open(os.path.join(ctx["run_dir"], "worker.stderr"), "wb") as errf:
+        ctx["record"].update(status="running", started_at=time.time(), tool_calls=0)
+        write_run_json(ctx["run_dir"], ctx["record"])
         proc = subprocess.Popen(argv, cwd=ctx["src"], env=env, shell=False, stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, stderr=errf, start_new_session=True)
 
@@ -1120,6 +1157,7 @@ def cmd_run(args, ohome):
     def finish(status, extra=None):
         rec["status"] = status
         rec["duration_s"] = round(time.monotonic() - t0, 1)
+        rec["ended_at"] = time.time()
         rec.update(extra or {})
         write_run_json(ctx["run_dir"], rec)
 

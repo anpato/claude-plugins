@@ -24,6 +24,9 @@ export type SquadAgent = {
   stepsTotal?: number
   note?: string
   // What it is doing now; and, for a finished agent's costume, how often it did each.
+  // Every tool call but the step tool, and the last tool call or model request.
+  toolCalls?: number
+  lastActivityAt?: number
   activity?: SquadActivity
   activityCounts?: Partial<Record<SquadActivity, number>>
 }
@@ -46,6 +49,8 @@ declare module 'claude-code' {
       isFinishedCollapsed: boolean
       // The terminal draws real pixels (Ghostty, kitty): vehicles are images, not blocks.
       hasPixels: boolean
+      // Offload runs read from ~/.cache/offload/runs, drawn as rows.
+      offloadRuns: SquadAgent[]
     }
   }
 }
