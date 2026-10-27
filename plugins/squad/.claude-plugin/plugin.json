@@ -3,8 +3,7 @@
   "description": "A live panel of this session's subagents as tiny vehicles: what each is doing, its model, effort, steps, context, tokens and time, with an activity bar and a one-line band above the prompt. /squad opens it.",
   "version": "1.1.1",
   "author": {
-    "name": "apato",
-    "email": "apato@legalzoom.com"
+    "name": "apato"
   },
   "license": "MIT",
   "keywords": [
