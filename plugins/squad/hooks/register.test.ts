@@ -211,6 +211,24 @@ test('the prompt is left alone unless askForSteps is on', async ($, on) => {
   expect(promptSeen).toBe(spawnInput.prompt)
 })
 
+test('the step tool is registered only when askForSteps is on', async ($, on) => {
+  const seen: string[] = []
+  on('session.start', () => ({ cwd: '/' }) as never)
+  on('command.register', () => ({ value: undefined }) as never)
+  on('tool.register', (_$, e) => { seen.push(e.name); return { value: undefined } as never })
+  await startSession($)
+  expect(seen).not.toContain('step')
+})
+
+test('askForSteps on registers the step tool', { options: { askForSteps: true } }, async ($, on) => {
+  const seen: string[] = []
+  on('session.start', () => ({ cwd: '/' }) as never)
+  on('command.register', () => ({ value: undefined }) as never)
+  on('tool.register', (_$, e) => { seen.push(e.name); return { value: undefined } as never })
+  await startSession($)
+  expect(seen).toContain('step')
+})
+
 test('rows count tool calls, not the step tool', async ($, on) => {
   mock.clock(on)
   on('agent.spawn', () => ({ model: 'claude-sonnet-5-5', agentId: 'k1' }))

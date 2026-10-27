@@ -224,7 +224,9 @@ export const register: Register = (on, options) => {
       description: 'Show the subagents panel (open, close or reset)',
       argumentHint: '[open|close|reset]',
     })
-    await $.tool.register({
+    // Only when asked: the description alone makes agents call it, about a
+    // third of a short agent's tool calls, and activity already shows progress.
+    if (options.askForSteps === true) await $.tool.register({
       name: 'step',
       description:
         'Report progress on your own task to the squad panel. After reading your task, call it ' +
