@@ -964,7 +964,7 @@ import time  # noqa: E402
 def test_defaults_v03():
     assert offload.DEFAULT_MAX_TURNS == 60
     assert offload.build_parser().parse_args(["run", "--repo", "r", "--brief", "b"]).max_turns == 60
-    assert offload.DEFAULT_READ_HOME == (".rustup", ".cargo/registry")
+    assert offload.DEFAULT_READ_HOME == (".rustup",)
     assert offload.WORKER_PREAMBLE == (
         "You are working in a copy of the repo, in the current directory. git works locally: there is no remote. "
         "There is no network except the model. Make temp files with `mktemp -d \"$TMPDIR/x.XXXXXX\"`. Write the "
@@ -1045,10 +1045,12 @@ def test_default_read_roots_skip_with_warning(tmp_path):
     for d in (home, outside, home / ".rustup"):
         d.mkdir(parents=True)
     (home / ".cargo").mkdir()
-    (home / ".cargo" / "registry").symlink_to(outside)  # leaves $HOME: fails validation
     roots, warnings = offload.default_read_roots(home=str(home))
-    assert roots == [os.path.realpath(home / ".rustup")]
-    assert len(warnings) == 1 and ".cargo/registry" in warnings[0]
+    assert roots == [os.path.realpath(home / ".rustup")] and warnings == []
+    (home / ".rustup").rmdir()
+    (home / ".rustup").symlink_to(outside)  # leaves $HOME: fails validation
+    roots, warnings = offload.default_read_roots(home=str(home))
+    assert roots == [] and len(warnings) == 1 and ".rustup" in warnings[0]
     assert offload.default_read_roots(home=str(tmp_path / "empty")) == ([], [])  # absent roots are silent
 
 
@@ -1057,8 +1059,8 @@ def test_default_read_roots_both_present(tmp_path):
     (tmp_path / ".cargo" / "registry").mkdir(parents=True)
     (tmp_path / ".cargo" / "git").mkdir()
     roots, warnings = offload.default_read_roots(home=str(tmp_path))
-    assert sorted(roots) == sorted(os.path.realpath(tmp_path / d) for d in (".rustup", ".cargo/registry"))
-    assert warnings == []  # .cargo/git is opt-in, never a default
+    assert roots == [os.path.realpath(tmp_path / ".rustup")]
+    assert warnings == []  # ~/.cargo/registry and ~/.cargo/git are opt-in, never defaults
 
 
 def test_prepare_run_adds_defaults_and_keeps_warnings(tmp_path, repo, monkeypatch):
@@ -1272,7 +1274,7 @@ def test_registry_get_with_body_refused(reg_proxy):
 @pytest.mark.parametrize("target", [
     "http://pypi.org/simple/pip/", "http://example.com/", "https://evil.example/r/pypi/simple/",
     "/r/pypi/../../x", "/r/pypi/a/../b", "/r/pypi/a//b", "/r/pypi/a%2e%2e/b", "/r/pypi/%2e%2e%2fx",
-    "/r/pypi/a%5cb", "/r/pypi/a\\b", "/r/pypi/a%00b", "/r/pypi/a%0ab", "/r/pypi/%ff", "/r/nope/", "/r/pypi",
+    "/r/pypi/a%5cb", "/r/pypi/a\\b", "/r/pypi/%2Fblob", "/r/pypi/a%00b", "/r/pypi/a%0ab", "/r/pypi/%ff", "/r/nope/", "/r/pypi",
     "/r/", "/r", "/R/pypi/simple/", "/v1/messages", "/r/pypi/x?a=\\b", "/r/pypi/x?a=\x01"])
 def test_registry_path_and_target_rules_403(reg_proxy, target):
     reg, make, log = reg_proxy
@@ -1439,3 +1441,162 @@ def test_integration_cmd_run_inits_worker_git_writes_configs_and_reports_warning
     assert seen["log"] == "base"
     assert f"sparse+http://127.0.0.1:{seen['port']}/r/crates-index/" in seen["cargo"]
     assert f"http://127.0.0.1:{seen['port']}/r/maven/" in seen["mvn"]
+
+
+# ------------------------------------------------------------------ fix pass (Opus review of 7f02271)
+
+def test_registry_304_passes_through(reg_proxy):
+    reg, make, _ = reg_proxy
+    px, port = make()
+    reg.pages["/blob"] = (304, {"ETag": '"e1"', "Last-Modified": "Mon, 01 Jan 2024 00:00:00 GMT"}, b"")
+    r, data = get(port, "/r/pypi/blob", headers={"If-None-Match": '"e1"'})
+    assert r.status == 304 and data == b"" and r.getheader("ETag") == '"e1"'
+    assert r.getheader("Last-Modified")
+
+
+def test_registry_relative_location_does_not_double_base_path(reg_proxy):
+    reg, make, _ = reg_proxy
+    px, port = make(routes={"/r/maven/": f"http://127.0.0.1:{reg.port}/maven2/"})
+    reg.pages["/maven2/a/b"] = (302, {"Location": "c"}, b"")
+    r, _ = get(port, "/r/maven/a/b")
+    assert r.status == 302 and r.getheader("Location") == f"http://127.0.0.1:{port}/r/maven/a/c"
+
+
+def test_registry_budget_counts_rewrite_bytes_including_oversize(reg_proxy):
+    reg, make, _ = reg_proxy
+    px, port = make(rewrite_cap=50)
+    reg.pages["/simple/big/"] = (200, {"Content-Type": "text/html"}, b"x" * 60)
+    reg.pages["/simple/ok/"] = (200, {"Content-Type": "text/html"}, b"y" * 40)
+    assert get(port, "/r/pypi/simple/big/")[0].status == 502
+    assert px.downloaded == 51  # cap + 1 bytes were read before the cap check
+    assert get(port, "/r/pypi/simple/ok/")[0].status == 200
+    assert px.downloaded == 91  # counted once, not again when sent
+
+
+@pytest.mark.parametrize("addr", ["::127.0.0.1", "64:ff9b::7f00:1", "::ffff:127.0.0.1", "::ffff:10.0.0.1", "::10.0.0.1"])
+def test_embedded_ipv4_in_ipv6_is_blocked(addr):
+    res = lambda host, port, **kw: [(socket.AF_INET6, 1, 6, "", (addr, port, 0, 0))]
+    with pytest.raises(offload.UpstreamBlocked):
+        offload.connect_registry("pypi.org", resolver=res)
+
+
+def test_connect_tries_each_vetted_address(monkeypatch):
+    tried = []
+
+    def fake_cc(addr, timeout=None):
+        tried.append(addr)
+        if addr[0] == "151.101.0.1":
+            raise ConnectionRefusedError()
+        raise ssl.SSLError("stop here")  # past the connect loop; enough to prove the second address was used
+    import ssl as _ssl
+    globals()["ssl"] = _ssl
+    res = lambda host, port, **kw: [(2, 1, 6, "", ("151.101.0.1", port)), (2, 1, 6, "", ("151.101.0.2", port))]
+    monkeypatch.setattr(offload.socket, "create_connection", fake_cc)
+    conn = offload.connect_registry("pypi.org", resolver=res)
+    with pytest.raises(OSError):
+        conn.connect()
+    assert tried == [("151.101.0.1", 443), ("151.101.0.2", 443)]
+
+
+import ssl  # noqa: E402
+
+
+def test_pinned_connect_verifies_certificate_and_uses_vetted_ip(monkeypatch, tmp_path):
+    key, crt = tmp_path / "k.pem", tmp_path / "c.pem"
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key), "-out", str(crt),
+                    "-subj", "/CN=pypi.org", "-days", "1"], check=True, capture_output=True)
+    sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    sctx.load_cert_chain(str(crt), str(key))
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(5)
+
+    def serve():
+        try:
+            c, _ = srv.accept()
+            try:
+                sctx.wrap_socket(c, server_side=True)
+            except OSError:
+                pass
+        except OSError:
+            pass
+    threading.Thread(target=serve, daemon=True).start()
+    real_cc, seen = socket.create_connection, []
+
+    def fake_cc(addr, timeout=None):
+        seen.append(addr)
+        return real_cc(("127.0.0.1", srv.getsockname()[1]), timeout)
+    monkeypatch.setattr(offload.socket, "create_connection", fake_cc)
+    cctx = ssl.create_default_context()  # default verification: the self-signed cert is not trusted
+    names, orig = [], cctx.wrap_socket
+    cctx.wrap_socket = lambda sock, **kw: (names.append(kw.get("server_hostname")), orig(sock, **kw))[1]
+    res = lambda host, port, **kw: [(2, 1, 6, "", ("151.101.0.223", port))]
+    conn = offload.connect_registry("pypi.org", resolver=res, ssl_context=cctx, timeout=5)
+    try:
+        with pytest.raises(ssl.SSLCertVerificationError):
+            conn.connect()
+    finally:
+        srv.close()
+    assert seen == [("151.101.0.223", 443)] and names == ["pypi.org"]
+
+
+def test_registry_pipelined_second_request_is_not_served(reg_proxy):
+    reg, make, _ = reg_proxy
+    px, port = make()
+    reg.pages["/simple/pip/"] = (200, {"Content-Type": "text/plain"}, b"ok")
+    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    one = b"GET /r/pypi/simple/pip/ HTTP/1.1\r\nHost: x\r\n\r\n"
+    s.sendall(one + one)
+    buf = b""
+    while True:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+    s.close()
+    assert buf.count(b"HTTP/1.1 ") == 1 and len(reg.seen) == 1
+
+
+def test_sensitive_lists_fix_pass():
+    names = ["package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "Cargo.lock", "go.sum",
+             "poetry.lock", "uv.lock", "Pipfile", "Pipfile.lock", ".pnpmfile.cjs", "gradle-wrapper.properties",
+             ".cargo/config.toml", "a/.mvn/maven.config", ".mvn/jvm.config"]
+    assert offload.sensitive_paths(names) == names
+    assert {".cargo", ".mvn"} <= offload.SENSITIVE_DIRS
+
+
+def test_registry_request_log_and_summary(reg_proxy):
+    reg, make, log = reg_proxy
+    px, port = make()
+    reg.pages["/npm/left-pad"] = (200, {"Content-Type": "application/json"}, b"{}")
+    get(port, "/r/npm/left-pad")
+    get(port, "/r/npm/left-pad/-/left-pad-1.tgz")
+    get(port, "/r/npm/other")
+    get(port, "/r/pypi/simple/pip/")
+    assert px.request_log == str(log.parent / "registry_requests.log")
+    lines = Path(px.request_log).read_text().splitlines()
+    assert len(lines) == 4
+    assert "GET /r/npm/left-pad 200 2" in lines[0] and " 404 " in lines[1]
+    assert px.registry_summary() == {"count": 4, "packages": ["left-pad", "other", "simple"]}
+    for i in range(60):
+        px.log_request("GET", f"/r/npm/p{i}", 200, 0, f"p{i}")
+    assert len(px.registry_summary()["packages"]) == 50 and px.registry_summary()["count"] == 64
+    px.log_request("GET", "/r/npm/a\x1b[31mb", 200, 0, "a\x1b[31mb")
+    assert "\x1b" not in Path(px.request_log).read_text()
+
+
+@needs_sandbox
+def test_cmd_run_reports_registry_requests(tmp_path, repo, monkeypatch, capsys):
+    ohome = os.path.realpath(tmp_path / "ohome")
+    brief = tmp_path / "brief.md"
+    brief.write_text("do it\n")
+    monkeypatch.setattr(offload, "resolve_claude", lambda allow=False: fake_claude())
+    monkeypatch.setattr(offload, "run_selftest", lambda c: (True, []))
+    monkeypatch.setattr(offload, "launch_worker", lambda *a, **k: {
+        "init_problems": [], "saw_init": True, "timed_out": False, "result": {"is_error": False}, "usage": {},
+        "text": "", "returncode": 0, "turns": 1, "survivors_killed": []})
+    assert offload.main(["--home", ohome, "run", "--repo", str(repo), "--brief", str(brief), "--slug", "job"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["registry_requests"] == {"count": 0, "packages": []}
+    rec = json.loads((Path(ohome) / "runs" / out["run_id"] / "run.json").read_text())
+    assert rec["registry_requests"] == {"count": 0, "packages": []}

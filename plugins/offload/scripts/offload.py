@@ -63,8 +63,8 @@ PRICES = {"kimi-k3:cloud": (3.0, 0.30, 15.0)}
 ALLOW_READ_HOME = ("go/pkg/mod", ".cargo/registry", ".cargo/git", ".rustup", ".m2/repository",
                    ".gradle/caches", ".npm/_cacache")
 ALLOW_READ_REPO = ("node_modules", "vendor", ".venv")
-# Readable on every run when present: toolchains and the crates.io index and sources (public content only).
-DEFAULT_READ_HOME = (".rustup", ".cargo/registry")
+# Readable on every run when present: toolchains only. ~/.cargo/registry can hold private registries.
+DEFAULT_READ_HOME = (".rustup",)
 PROXY_ALLOWED_PATHS = ("/v1/messages", "/v1/messages/count_tokens")
 PROXY_MAX_BODY = 32 * 1024 * 1024
 PROXY_UPSTREAM_TIMEOUT = 900
@@ -84,12 +84,15 @@ PROXY_HEADER_DEADLINE = 60
 PROXY_RUN_BUDGET = 4 * 1024 ** 3
 PROXY_REWRITE_CAP = 64 * 1024 * 1024
 OUTPUT_RING = 64 * 1024
-SENSITIVE_DIRS = {".claude", ".github", ".husky", ".githooks", ".vscode", ".idea"}
+SENSITIVE_DIRS = {".claude", ".github", ".husky", ".githooks", ".vscode", ".idea", ".cargo", ".mvn"}
 SENSITIVE_BASENAMES = {"Makefile", "package.json", "conftest.py", "setup.py", "build.rs", ".envrc",
                        ".pre-commit-config.yaml", "pyproject.toml", "setup.cfg", "sitecustomize.py",
                        "usercustomize.py", "Justfile", "Rakefile", "Dockerfile", ".npmrc",
                        "requirements.txt", "Cargo.toml", "go.mod", "pom.xml", "build.gradle", "build.gradle.kts",
-                       "settings.gradle", "settings.gradle.kts", ".pypirc"}
+                       "settings.gradle", "settings.gradle.kts", ".pypirc",
+                       "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "Cargo.lock",
+                       "go.sum", "poetry.lock", "uv.lock", "Pipfile", "Pipfile.lock", ".pnpmfile.cjs",
+                       "gradle-wrapper.properties"}
 SENSITIVE_PREFIXES = ("lefthook", "docker-compose", ".yarnrc", "requirements")
 ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[@-Z\\-_])")
 
@@ -505,19 +508,37 @@ class UpstreamBlocked(OSError):
     """An upstream connection the proxy refuses to make (a non-global address)."""
 
 
+# IPv6 forms that embed an IPv4 address (loopback, private) but that is_global can report as global.
+_EMBEDDED_V4 = [ipaddress.ip_network(n) for n in ("::/96", "::ffff:0:0/96", "64:ff9b::/96")]
+
+
+def _is_public_ip(addr):
+    ip = ipaddress.ip_address(addr.split("%")[0])
+    if ip.version == 6 and any(ip in n for n in _EMBEDDED_V4):
+        return False
+    return ip.is_global
+
+
 def connect_registry(host, port=443, resolver=socket.getaddrinfo, ssl_context=None, timeout=60):
     """Open a verified TLS connection to a registry host. Every resolved address must be globally routable;
     the connection goes to the vetted address (no second lookup) with SNI and certificate checks for `host`."""
     infos = resolver(host, port, type=socket.SOCK_STREAM)
     addrs = [i[4][0] for i in infos]
-    if not addrs or not all(ipaddress.ip_address(a.split("%")[0]).is_global for a in addrs):
+    if not addrs or not all(_is_public_ip(a) for a in addrs):
         raise UpstreamBlocked(f"{host} resolves to a non-global address")
     ctx = ssl_context or ssl.create_default_context()
-    ip = addrs[0]
 
     class Pinned(http.client.HTTPSConnection):
         def connect(self):
-            sock = socket.create_connection((ip, self.port), self.timeout)
+            last = None
+            for ip in addrs:  # only vetted addresses, in order; no second lookup
+                try:
+                    sock = socket.create_connection((ip, self.port), self.timeout)
+                    break
+                except OSError as e:
+                    last = e
+            else:
+                raise last
             self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
 
     return Pinned(host, port, context=ctx, timeout=timeout)
@@ -563,7 +584,7 @@ class EgressProxy:
 
     def __init__(self, upstream_url, reject_log, max_body=PROXY_MAX_BODY, routes=None, connector=None,
                  max_conns=PROXY_MAX_CONNS, max_upstream=PROXY_MAX_UPSTREAM, header_deadline=PROXY_HEADER_DEADLINE,
-                 run_budget=PROXY_RUN_BUDGET, rewrite_cap=PROXY_REWRITE_CAP, upstream_wait=30):
+                 run_budget=PROXY_RUN_BUDGET, rewrite_cap=PROXY_REWRITE_CAP, upstream_wait=30, request_log=None):
         up = urlsplit(upstream_url)
         self.scheme, self.host = up.scheme, up.hostname
         self.port = up.port or (443 if up.scheme == "https" else 80)
@@ -573,6 +594,9 @@ class EgressProxy:
         self.max_conns, self.header_deadline = max_conns, header_deadline
         self.run_budget, self.rewrite_cap, self.upstream_wait = run_budget, rewrite_cap, upstream_wait
         self.downloaded = 0
+        self.request_log = request_log or os.path.join(os.path.dirname(reject_log) or ".", "registry_requests.log")
+        self.requests = 0
+        self.packages = []
         self._slots = threading.BoundedSemaphore(max_upstream)
         self._lock = threading.Lock()
         self._conns = set()
@@ -589,6 +613,22 @@ class EgressProxy:
         with self._lock:
             with open(self.reject_log, "a") as f:
                 f.write(line)
+
+    def log_request(self, method, path, status, nbytes, rest):
+        """One line per /r/ request in registry_requests.log, plus the count and distinct first segments."""
+        line = "%s %s %s %s %d\n" % (time.strftime("%Y-%m-%dT%H:%M:%S%z"), method[:16],
+                                     path[:512].encode("unicode_escape").decode("ascii"), status, nbytes)
+        seg = rest.split("/", 1)[0][:100].encode("unicode_escape").decode("ascii") if rest else ""
+        with self._lock:
+            self.requests += 1
+            if seg and seg not in self.packages and len(self.packages) < 50:
+                self.packages.append(seg)
+            with open(self.request_log, "a") as f:
+                f.write(line)
+
+    def registry_summary(self):
+        with self._lock:
+            return {"count": self.requests, "packages": list(self.packages)}
 
     def _upstream(self):
         cls = http.client.HTTPSConnection if self.scheme == "https" else http.client.HTTPConnection
@@ -609,7 +649,7 @@ class EgressProxy:
             decoded = unquote(rest, errors="strict")  # once
         except UnicodeDecodeError:
             return None
-        if (".." in decoded or "//" in decoded or "\\" in decoded
+        if (decoded.startswith("/") or ".." in decoded or "//" in decoded or "\\" in decoded
                 or any(ord(c) < 32 or ord(c) == 127 for c in decoded)):
             return None
         if not re.fullmatch(r"[A-Za-z0-9%._~!$&'()*+,;=:@/?-]*", query):
@@ -686,7 +726,12 @@ class EgressProxy:
                 except OSError:
                     pass
 
+            def send_response(self, code, message=None):
+                self._code = code
+                super().send_response(code, message)
+
             def parse_request(self):
+                self._sent, self._code = 0, 0
                 ok = super().parse_request()
                 self._timer.cancel()
                 return ok
@@ -694,6 +739,7 @@ class EgressProxy:
             def _reply(self, code, text):
                 body = (text + "\n").encode()
                 self.close_connection = True
+                self._sent = getattr(self, "_sent", 0) + (0 if self.command == "HEAD" else len(body))
                 self.send_response(code)
                 self.send_header("Content-Type", "text/plain")
                 self.send_header("Content-Length", str(len(body)))
@@ -796,15 +842,18 @@ class EgressProxy:
                             or self.headers.get("Content-Length", "0").strip() not in ("", "0"))
                 if not route or has_body:
                     return self._reject()
-                if proxy.downloaded >= proxy.run_budget:
-                    proxy.log_reject(self.command, self.path + " [download budget used]")
-                    return self._reply(403, "download budget used")
-                if not proxy._slots.acquire(timeout=proxy.upstream_wait):
-                    return self._reply(503, "too many upstream requests")
                 try:
-                    self._registry(*route)
+                    if proxy.downloaded >= proxy.run_budget:
+                        proxy.log_reject(self.command, self.path + " [download budget used]")
+                        return self._reply(403, "download budget used")
+                    if not proxy._slots.acquire(timeout=proxy.upstream_wait):
+                        return self._reply(503, "too many upstream requests")
+                    try:
+                        self._registry(*route)
+                    finally:
+                        proxy._slots.release()
                 finally:
-                    proxy._slots.release()
+                    proxy.log_request(self.command, self.path, self._code, self._sent, route[2])
 
             do_HEAD = do_GET
 
@@ -830,9 +879,10 @@ class EgressProxy:
                     except (OSError, http.client.HTTPException, ssl.SSLError) as e:
                         return self._reply(502, f"upstream error: {type(e).__name__}")
                     self.close_connection = True
-                    if 300 <= resp.status < 400:
+                    if resp.status in (301, 302, 303, 307, 308):
                         loc = resp.getheader("Location")
-                        mapped = proxy.map_location(urljoin(base.rstrip("/") + upath, loc)) if loc else None
+                        mapped = (proxy.map_location(urljoin(f"{up.scheme}://{up.netloc}{upath}", loc))
+                                  if loc else None)
                         if not mapped:
                             return self._reply(502, "redirect to a host that is not routed")
                         self.send_response(resp.status)
@@ -847,6 +897,8 @@ class EgressProxy:
                     data = None
                     if rule and self.command != "HEAD":
                         data = resp.read(proxy.rewrite_cap + 1)
+                        with proxy._lock:
+                            proxy.downloaded += len(data)  # every byte read from upstream counts
                         if len(data) > proxy.rewrite_cap:
                             return self._reply(502, "metadata too large to rewrite")
                         try:
@@ -863,7 +915,7 @@ class EgressProxy:
                             self.send_header("Content-Length", str(len(data)))
                         self.end_headers()
                         if data is not None:
-                            self._send_counted(data)
+                            self._send_counted(data, count=False)
                         return
                     if resp.getheader("Content-Length"):
                         self.send_header("Content-Length", resp.getheader("Content-Length"))
@@ -885,9 +937,11 @@ class EgressProxy:
                             proxy._conns.discard(conn)
                         conn.close()
 
-            def _send_counted(self, chunk):
-                with proxy._lock:
-                    proxy.downloaded += len(chunk)
+            def _send_counted(self, chunk, count=True):
+                if count:
+                    with proxy._lock:
+                        proxy.downloaded += len(chunk)
+                self._sent += len(chunk)
                 self.wfile.write(chunk)
                 self.wfile.flush()
 
@@ -1585,6 +1639,7 @@ def cmd_run(args, ohome):
             w = launch_worker(ctx, brief, args.timeout_min * 60)
         finally:
             proxy.stop()  # as soon as the worker ends, times out, or fails the init check
+        out["registry_requests"] = rec["registry_requests"] = proxy.registry_summary()
         out.update(turns=w["turns"], usage=w["usage"], est_cost_usd=estimate_cost(args.model, w["usage"]),
                    survivors_killed=w["survivors_killed"])
         if w["init_problems"] or not w["saw_init"]:

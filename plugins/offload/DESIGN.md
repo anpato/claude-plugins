@@ -324,8 +324,8 @@ tests the brief asks for, run the tests, commit if you like, and finish with a s
 - **Web tools stay off.** `DENIED_TOOLS` is unchanged. Docs the worker needs go in the brief.
 - **`DEFAULT_MAX_TURNS` goes from 40 to 60.**
 - **Toolchain caches are readable by default, limited to public content** (narrowed after the Opus review, F3).
-  The default roots are `DEFAULT_READ_HOME = (".rustup", ".cargo/registry")`: toolchains and the crates.io index
-  and sources. Each is added on every run if it exists and passes `validate_allow_read`. A default root that fails
+  The default roots are `DEFAULT_READ_HOME = (".rustup",)`: toolchains only. `~/.cargo/registry` is not a default (fix pass): it can
+  hold private alternate registries, and the worker's `CARGO_HOME` does not use it. Each is added on every run if it exists and passes `validate_allow_read`. A default root that fails
   validation is skipped with a warning in the output; it does not fail the run.
   - `~/go/pkg/mod` stays opt-in through `--allow-read`. Its download cache holds `github.com/...` modules, which may
     include the owner's private repos (checked: `ls ~/go/pkg/mod/cache/download` lists github.com, gitlab.com, ...).
@@ -400,6 +400,10 @@ filters the HTTP.
 
 **Residual risk, accepted** (unchanged in kind):
 - Path-encoded data in a GET reaches only the registry operator, never anything public, because writes are blocked.
+  Correction (fix pass): which of an attacker's package files the worker fetches is a signal that leaks through
+  public download stats. It is bounded by the request log and count (`<run>/registry_requests.log`, and
+  `registry_requests: {count, packages}` in the run output and run.json, packages being the distinct first path
+  segment after the route, max 50) and by the opt-in decision pending on the board.
 - Install scripts run inside the sandbox.
 - New dependencies land in the diff for review. `SENSITIVE_BASENAMES` gains `requirements.txt`, `Cargo.toml`,
   `go.mod`, `pom.xml`, `build.gradle`, `build.gradle.kts`, `settings.gradle`, `settings.gradle.kts` and `.pypirc`,

@@ -46,7 +46,7 @@ The worker model and all it writes are untrusted.
 
 - Work like Claude in a repo: `git` (local, no remote), `python3`, temp files (`mktemp -d "$TMPDIR/x.XXXXXX"`) and zsh heredocs all work in the sandbox. The Command Line Tools come first on its PATH.
 - Install dependencies from pypi, npm, crates.io and maven through the same loopback port. The proxy serves read-only `GET`/`HEAD` on six fixed routes (`/r/pypi/`, `/r/pyfiles/`, `/r/npm/`, `/r/crates-index/`, `/r/crates-static/`, `/r/maven/`), rebuilds the headers, blocks private addresses and does not follow redirects. There is no CONNECT and no `HTTPS_PROXY`. Go modules are not fetched: use `--allow-read ~/go/pkg/mod`.
-- Read `~/.rustup` and `~/.cargo/registry` by default when they exist (public content only).
+- Read `~/.rustup` by default when it exists (public content only). Every registry request is logged to `<run>/registry_requests.log` and summarised as `registry_requests` in the run output.
 - Take up to 60 turns by default (`--max-turns`).
 - Dependency files it changes (`requirements.txt`, `Cargo.toml`, `go.mod`, `pom.xml`, `*.gradle`) are flagged for review.
 
