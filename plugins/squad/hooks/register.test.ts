@@ -318,6 +318,10 @@ test('offload runs show as rows, and bad files are skipped', async ($, on) => {
   expect(await ui.find({ text: /ancient/ })).toBeUndefined()
   // r1 started 90s before the poll, so its clock reads past 1:30.
   expect(await ui.find({ text: /1:3\d/ })).toBeDefined()
+  // The band counts offload runs too, with no subagent running.
+  const bar = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', component: 'AbovePrompt', props: band })
+  expect(await bar.find({ text: /squad · 2 running · 2 done/ })).toBeDefined()
+  await bar.unmount()
   // Offload runs are never flagged idle.
   await advanceMinutes(clock, 5)
   expect(await ui.find({ text: /idle/ })).toBeUndefined()

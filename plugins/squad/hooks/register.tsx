@@ -595,7 +595,7 @@ export const register: Register = (on, options) => {
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    const list = await read($, agents)
+    const list = [...(await read($, agents)), ...(await read($, offloadRuns))]
     const running = list.filter(a => a.status === 'running')
     if (e.props.hasSurvey || running.length === 0) return next(e)
 
