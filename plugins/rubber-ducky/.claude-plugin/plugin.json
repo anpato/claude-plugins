@@ -3,8 +3,7 @@
   "description": "Think through a hard or fuzzy problem out loud before writing code — a Socratic partner that reflects, probes, and reframes rather than jumping to solutions.",
   "version": "1.2.0",
   "author": {
-    "name": "apato",
-    "email": "apato@legalzoom.com"
+    "name": "apato"
   },
   "license": "MIT",
   "keywords": [

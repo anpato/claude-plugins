@@ -3,8 +3,7 @@
   "description": "Adversarial reviewer and red-teamer. Actively try to break code, PRs, designs, and plans — hunt bugs and failure modes instead of rubber-stamping.",
   "version": "1.0.0",
   "author": {
-    "name": "apato",
-    "email": "apato@legalzoom.com"
+    "name": "apato"
   },
   "license": "MIT",
   "keywords": [
