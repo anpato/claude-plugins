@@ -861,3 +861,85 @@ def test_integration_errors_are_recorded_in_run_json(tmp_path, repo, monkeypatch
     assert offload.main(["--home", ohome, "run", "--repo", str(repo), "--brief", str(brief), "--slug", "job"]) == 2
     rec = json.loads((Path(ohome) / "runs" / ctx["run_id"] / "run.json").read_text())
     assert rec["status"] == "error" and "fetch exploded" in rec["error"] and len(rec["head_sha"]) == 40
+
+
+# ------------------------------------------------------------------ run.json live state
+
+def _assistant(n_tools, mid="m"):
+    blocks = [{"type": "tool_use", "id": f"t{i}", "name": "Bash", "input": {}} for i in range(n_tools)]
+    return json.dumps({"type": "assistant", "message": {"id": mid, "content": blocks or [{"type": "text", "text": "hi"}]}})
+
+
+def _read_run_json(d):
+    with open(os.path.join(d, "run.json")) as f:
+        return json.load(f)
+
+
+def test_write_run_json_atomic_and_private(tmp_path):
+    offload.write_run_json(str(tmp_path), {"status": "prepared", "n": 1})
+    offload.write_run_json(str(tmp_path), {"status": "running", "n": 2})
+    assert os.listdir(tmp_path) == ["run.json"]  # temp file is gone
+    assert _read_run_json(tmp_path) == {"status": "running", "n": 2}
+    assert os.stat(tmp_path / "run.json").st_mode & 0o777 == 0o600
+
+
+def test_write_run_json_failure_leaves_old_file_and_no_tmp(tmp_path):
+    offload.write_run_json(str(tmp_path), {"ok": 1})
+    with pytest.raises(TypeError):
+        offload.write_run_json(str(tmp_path), {"bad": object()})
+    assert os.listdir(tmp_path) == ["run.json"] and _read_run_json(tmp_path) == {"ok": 1}
+
+
+def test_progress_counts_and_throttles(tmp_path):
+    now = [100.0]
+    rec = {"status": "running"}
+    p = offload.Progress(str(tmp_path), rec, interval=2.0, clock=lambda: now[0])
+    p.tool_use(2)
+    assert _read_run_json(tmp_path)["tool_calls"] == 2
+    now[0] = 101.0
+    p.tool_use(1)  # inside the window: in-memory only
+    assert rec["tool_calls"] == 3 and _read_run_json(tmp_path)["tool_calls"] == 2
+    now[0] = 102.5
+    p.tool_use(1)
+    on_disk = _read_run_json(tmp_path)
+    assert on_disk["tool_calls"] == 4 and on_disk["last_activity_at"] > 0
+
+
+def _fake_launch(monkeypatch, tmp_path, lines):
+    script = tmp_path / "fake.sh"
+    script.write_text("#!/bin/sh\ncat >/dev/null\n" + "".join(f"printf '%s\\n' '{ln}'\n" for ln in lines))
+    script.chmod(0o755)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (tmp_path / "src").mkdir()
+    monkeypatch.setattr(offload, "sandbox_argv", lambda profile, argv: [str(script)])
+    monkeypatch.setattr(offload, "worker_url", lambda ctx: "http://127.0.0.1:1")
+    monkeypatch.setattr(offload, "sweep_survivors", lambda proc, rd: [])
+    monkeypatch.setattr(offload, "check_init", lambda ev: [])
+    rec = {"status": "prepared"}
+    offload.write_run_json(str(run_dir), rec)
+    ctx = {"run_dir": str(run_dir), "model": "m", "max_thinking": 1000, "profile": "p", "src": str(tmp_path / "src"),
+           "claude": {"real": "/usr/bin/true"}, "max_turns": 1, "record": rec}
+    return ctx, run_dir
+
+
+def test_launch_worker_status_running_and_tool_calls(monkeypatch, tmp_path):
+    init = json.dumps({"type": "system", "subtype": "init"})
+    res = json.dumps({"type": "result", "num_turns": 2, "result": "done", "usage": {}})
+    ctx, run_dir = _fake_launch(monkeypatch, tmp_path, [init, _assistant(2, "a"), _assistant(0, "b"), _assistant(1, "c"), res])
+    seen = []
+    real_popen = subprocess.Popen
+
+    def spy(*a, **kw):
+        seen.append(dict(_read_run_json(run_dir)))  # run.json as of just before the worker starts
+        return real_popen(*a, **kw)
+
+    monkeypatch.setattr(offload.subprocess, "Popen", spy)
+    assert _read_run_json(run_dir)["status"] == "prepared"
+    w = offload.launch_worker(ctx, "brief", 30)
+    assert w["saw_init"] and w["turns"] == 2
+    assert seen[0]["status"] == "running" and isinstance(seen[0]["started_at"], float)
+    assert ctx["record"]["tool_calls"] == 3  # text-only message not counted
+    assert ctx["record"]["last_activity_at"] >= seen[0]["started_at"]
+    assert _read_run_json(run_dir)["tool_calls"] >= 1  # at least the first (unthrottled) write landed
+    assert [f for f in os.listdir(run_dir) if f.startswith("run.json")] == ["run.json"]

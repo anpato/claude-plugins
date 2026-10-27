@@ -35,8 +35,17 @@ how many are running.
 ## Settings (`/config`)
 
 - `autoOpen` (default on): open the panel when an agent starts.
-- `askForSteps` (default on): add one line to each subagent's prompt asking it to report its
-  steps through the mod's `step` tool.
+- `askForSteps` (default off): add one line to each subagent's prompt asking it to report its
+  steps through the mod's `step` tool. Rows already show `N calls` from the agent's real tool
+  calls, so this only adds a `done/total` plan and a note.
+- `stallAfterSec` (default 120): a running subagent with no tool call or model request for this
+  long shows `idle 3m` (yellow) in its row and `1 idle` in the band above the prompt.
+
+## Offload runs
+
+Runs under `~/.cache/offload/runs/*/run.json` (checked every 5 s, only if the directory exists)
+appear as `offload` rows: `prepared` or `running` runs while live, and `ok`, `failed` or `timeout`
+runs for an hour after they end. A missing or malformed `run.json` is skipped.
 
 ## Install
 
