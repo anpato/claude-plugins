@@ -348,6 +348,14 @@ def clt_bin_dir():
     return CLT_BIN if st.st_uid == 0 and os.path.isdir(CLT_BIN) else None
 
 
+def worker_path(clt):
+    """User toolchains first (Homebrew: current python3 and git, no xcrun shim), then the CLT, then the system.
+    The helper's own git keeps SAFE_PATH."""
+    head = ["/opt/homebrew/bin", "/usr/local/bin"] + ([clt] if clt else [])
+    rest = [d for d in SAFE_PATH.split(":") if d not in head]
+    return ":".join(head + rest)
+
+
 def go_modcache(allow_read, home=None):
     """The real ~/go/pkg/mod if --allow-read named it, else None."""
     root = os.path.realpath(os.path.join(home or real_home(), "go", "pkg", "mod"))
@@ -362,7 +370,8 @@ def build_worker_env(run_dir, model, base_url, max_thinking=DEFAULT_MAX_THINKING
     tmp = os.path.join(run_dir, "tmp")
     clt = clt_bin_dir()
     env = {
-        "PATH": f"{clt}:{SAFE_PATH}" if clt else SAFE_PATH,
+        "PATH": worker_path(clt),
+        "PYTHONDONTWRITEBYTECODE": "1",
         "HOME": os.path.join(run_dir, "home"),
         "LANG": lang or os.environ.get("LANG") or "en_US.UTF-8",
         "TMPDIR": tmp, "CLAUDE_CODE_TMPDIR": tmp, "TMPPREFIX": os.path.join(tmp, "zsh"),

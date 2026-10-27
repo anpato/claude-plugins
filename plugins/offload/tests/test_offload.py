@@ -175,7 +175,7 @@ def test_worker_env_exact_keys_and_no_inherited_token(monkeypatch):
         "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL",
         "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
         "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "MAX_THINKING_TOKENS",
-        "CARGO_HOME", "GOPROXY", "GOFLAGS", "GOSUMDB", "GOCACHE"}
+        "CARGO_HOME", "GOPROXY", "GOFLAGS", "GOSUMDB", "GOCACHE", "PYTHONDONTWRITEBYTECODE"}
     assert "ANTHROPIC_AUTH_TOKEN" not in env
     assert env["ANTHROPIC_BASE_URL"] == "http://localhost:11434"
     assert env["HOME"] == "/r/home" and env["TMPDIR"] == "/r/tmp" == env["CLAUDE_CODE_TMPDIR"]
@@ -977,11 +977,13 @@ def test_defaults_v03():
 def test_clt_first_on_worker_path_only_when_root_owned(monkeypatch, tmp_path):
     monkeypatch.setattr(offload, "CLT_BIN", "/usr/bin")  # exists and is root-owned
     env = offload.build_worker_env("/r", "m", "http://127.0.0.1:1")
-    assert env["PATH"] == f"/usr/bin:{offload.SAFE_PATH}"
+    assert env["PATH"].split(":")[:3] == ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"]
+    assert env["PYTHONDONTWRITEBYTECODE"] == "1"
     monkeypatch.setattr(offload, "CLT_BIN", str(tmp_path))  # exists, owned by the test user
-    assert offload.build_worker_env("/r", "m", "http://127.0.0.1:1")["PATH"] == offload.SAFE_PATH
+    assert str(tmp_path) not in offload.build_worker_env("/r", "m", "http://127.0.0.1:1")["PATH"]
     monkeypatch.setattr(offload, "CLT_BIN", str(tmp_path / "missing"))
-    assert offload.build_worker_env("/r", "m", "http://127.0.0.1:1")["PATH"] == offload.SAFE_PATH
+    path = offload.build_worker_env("/r", "m", "http://127.0.0.1:1")["PATH"].split(":")
+    assert sorted(path) == sorted(offload.SAFE_PATH.split(":")) and path[:2] == ["/opt/homebrew/bin", "/usr/local/bin"]
     # the helper's own git keeps SAFE_PATH
     assert f"PATH={offload.SAFE_PATH}" in offload.safe_git_argv(["status"], "/h", git_bin="/usr/bin/git")
 
@@ -1034,7 +1036,7 @@ def test_integration_worker_shell_python_git_and_temp(tmp_path, repo):
     r = sb("/bin/sh", "-c", 'mktemp -d "$TMPDIR/x.XXXXXX"')
     assert r.returncode == 0 and r.stdout.strip().startswith(os.path.join(ctx["run_dir"], "tmp") + "/x."), r.stderr
     r = sb("/bin/sh", "-c", "command -v python3 git; python3 -c 'import tempfile; print(tempfile.mkdtemp())'")
-    assert r.returncode == 0 and offload.CLT_BIN + "/python3" in r.stdout and "xcrun" not in r.stderr, r.stderr
+    assert r.returncode == 0 and "/usr/bin/python3" not in r.stdout and "xcrun" not in r.stderr, r.stderr
     offload.init_worker_git(ctx)
     r = sb("/bin/sh", "-c", "git status --short; git log --format=%s; echo x > n.txt; git add n.txt; "
                             "git commit -qm worker && git log --format=%s")

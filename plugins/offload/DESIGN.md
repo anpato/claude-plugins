@@ -79,9 +79,10 @@ It must not be able to:
      name too and only removes a file the check itself created.
 5. **Start the egress proxy, then launch the worker** with `sandbox-exec -f profile.sb <claude-realpath>` and an
    `env -i` environment holding exactly:
-   - `PATH=/Library/Developer/CommandLineTools/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin`.
-     The CLT dir is hard-coded, first, and present only if it exists and is root-owned. The helper's own git keeps
-     `SAFE_PATH`.
+   - `PATH=/opt/homebrew/bin:/usr/local/bin:/Library/Developer/CommandLineTools/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin`.
+     Homebrew comes first so `python3` is current (CLT ships 3.9, no `tomllib`). The CLT dir is hard-coded and present
+     only if it exists and is root-owned. The helper's own git keeps `SAFE_PATH`.
+   - `PYTHONDONTWRITEBYTECODE=1`, so `__pycache__` doesn't land in the commit.
    - `HOME=home`, `LANG`
    - `TMPDIR` and `CLAUDE_CODE_TMPDIR`, both set to `tmp`, and `TMPPREFIX=tmp/zsh`
    - registry settings (see "Registry proxy"): `PIP_INDEX_URL`, `PIP_TRUSTED_HOST`, `NPM_CONFIG_REGISTRY`,
@@ -296,7 +297,7 @@ reproduced and then checked under that run's `profile.sb`.
 
 | Friction | Cause (verified) | Fix |
 |---|---|---|
-| `python3`/`git` print `couldn't create cache file .../xcrun_db-*` and git exits 128 | `/usr/bin/{python3,git}` are xcrun shims (see Known limitation) | Put `/Library/Developer/CommandLineTools/usr/bin` first on the **worker's** PATH. The CLT binaries ran clean under the profile: `tempfile.mkdtemp()` landed in `tmp`, and `git init` worked. The helper's own git keeps `SAFE_PATH`. |
+| `python3`/`git` print `couldn't create cache file .../xcrun_db-*` and git exits 128 | `/usr/bin/{python3,git}` are xcrun shims (see Known limitation) | Put `/opt/homebrew/bin` then `/Library/Developer/CommandLineTools/usr/bin` ahead of the shims on the **worker's** PATH (Homebrew python3 3.15 and git 2.56 also ran clean under the profile; live run 0c1c2152 hit CLT Python 3.9's missing `tomllib`). The CLT binaries ran clean under the profile: `tempfile.mkdtemp()` landed in `tmp`, and `git init` worked. The helper's own git keeps `SAFE_PATH`. |
 | zsh heredoc: `can't create temp file for here document` | `TMPPREFIX` is a file-name prefix, not a dir. `TMPPREFIX=<run>/tmp` makes `<run>/tmpXXXX`, which is outside the writable `tmp/` | `TMPPREFIX=<run>/tmp/zsh`. With that set, the heredoc worked. |
 | `mktemp -d` fails on `/var/folders/...` | macOS `mktemp` ignores `TMPDIR` without a template, and with `-t` too (both checked) | The preamble says: use `mktemp -d "$TMPDIR/x.XXXXXX"`. That form worked. Nothing is opened in `/var/folders`. |
 | `git status` → `not a git repository` | `src` is a `git archive` export with no `.git` | See below. |
