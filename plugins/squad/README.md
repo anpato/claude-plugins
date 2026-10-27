@@ -35,8 +35,8 @@ how many are running.
 ## Settings (`/config`)
 
 - `autoOpen` (default on): open the panel when an agent starts.
-- `askForSteps` (default off): add one line to each subagent's prompt asking it to report its
-  steps through the mod's `step` tool. Rows already show `N calls` from the agent's real tool
+- `askForSteps` (default off): register the `step` tool and add one line to each subagent's prompt asking it to
+  report its steps through it. Off, the tool doesn't exist, so agents spend no calls on it. Rows already show `N calls` from the agent's real tool
   calls, so this only adds a `done/total` plan and a note.
 - `stallAfterSec` (default 120): a running subagent with no tool call or model request for this
   long shows `idle 3m` (yellow) in its row and `1 idle` in the band above the prompt.
