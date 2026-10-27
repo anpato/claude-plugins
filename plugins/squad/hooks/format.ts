@@ -5,6 +5,8 @@ export const totalTokens = (usage: SquadUsage): number =>
 
 // 'claude-opus-5-5' -> 'Opus 5.5'; anything else is shown as given.
 export const modelLabel = (model: string): string => {
+  const kimi = /^kimi-k(\d+)/i.exec(model)
+  if (kimi) return `Kimi K${kimi[1]}`
   const match = /(fable|mythos|opus|sonnet|haiku)-(\d+)(?:-(\d+))?/i.exec(model)
   if (!match) return model
   const [, family = '', major, minor] = match
