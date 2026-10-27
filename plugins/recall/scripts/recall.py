@@ -1,22 +1,36 @@
 #!/usr/bin/env python3
-"""Find past Claude Code sessions in any project and print a digest of one.
+"""Find past Claude Code sessions in any project, print a digest of one, or report usage.
 
-Read-only. Scans ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl (top level
-only; subagent transcripts live deeper and are skipped).
+Read-only. Scans ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl. The usage
+subcommand also reads <session-id>/subagents/agent-*.jsonl; list/search/digest
+stay at the top level and skip subagent transcripts.
 
   recall.py list   [--project SUBSTR] [--limit N] [--include-tmp]
   recall.py search QUERY [--project SUBSTR] [--limit N] [--include-tmp]
   recall.py digest ID_OR_PREFIX [--max-chars N]
+  recall.py usage  [--days N] [--by day|week] [--project SUBSTR] [--json]
+
+usage reports per-day (or ISO-week) buckets. Units are weighted tokens:
+input + 1.25*cache_creation + 0.1*cache_read + 5*output (missing fields = 0).
+Each message.id is counted once per file. --json prints a list of buckets,
+oldest first, each:
+  {"bucket": "YYYY-MM-DD" or "YYYY-Www",
+   "units": total weighted units, "requests": unique messages counted,
+   "main_units", "subagent_units", "subagent_share": 0..1,
+   "models": {"opus", "sonnet", "haiku", "other"} -> weighted units,
+   "main_files", "subagent_files": distinct files with >=1 counted message,
+   "median_context": median of input+cache_creation+cache_read per request}
 """
 import argparse
 import json
 import os
 import re
 import shutil
+import statistics
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 HEAD_BYTES = 8 * 1024
@@ -462,6 +476,132 @@ def cmd_digest(args):
     print(build_digest(matches[0], args.max_chars))
 
 
+MODEL_FAMILIES = ("opus", "sonnet", "haiku")
+
+
+def model_family(model):
+    m = (model or "").lower()
+    for fam in MODEL_FAMILIES:
+        if fam in m:
+            return fam
+    return "other"
+
+
+def usage_files(root, project=None):
+    """Every transcript as (path, kind), kind 'main' or 'subagent', filtered by project dir name."""
+    if not root.is_dir():
+        return []
+    out = []
+    for proj in sorted(root.iterdir()):
+        if not proj.is_dir():
+            continue
+        if project and project.lower() not in proj.name.lower():
+            continue
+        for p in sorted(proj.glob("*.jsonl")):
+            if p.is_file():
+                out.append((p, "main"))
+        for p in sorted(proj.glob("*/subagents/agent-*.jsonl")):
+            if p.is_file():
+                out.append((p, "subagent"))
+    return out
+
+
+def usage_messages(path):
+    """Yield (timestamp, model, weighted units, context) for the first line of each message.id."""
+    seen = set()
+    for rec in iter_records(path):
+        if rec.get("type") != "assistant":
+            continue
+        msg = rec.get("message")
+        if not isinstance(msg, dict):
+            continue
+        usage, mid = msg.get("usage"), msg.get("id")
+        if not mid or mid in seen or not isinstance(usage, dict):
+            continue
+        ts = parse_ts(rec.get("timestamp"))
+        if ts is None:
+            continue
+        seen.add(mid)
+
+        def tok(key):
+            v = usage.get(key, 0)
+            return v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+
+        inp = tok("input_tokens")
+        cc = tok("cache_creation_input_tokens")
+        cr = tok("cache_read_input_tokens")
+        out = tok("output_tokens")
+        yield ts, msg.get("model"), inp + 1.25 * cc + 0.1 * cr + 5 * out, inp + cc + cr
+
+
+def bucket_key(ts, by):
+    if by == "week":
+        iso = ts.isocalendar()
+        return f"{iso[0]}-W{iso[1]:02d}"
+    return ts.date().isoformat()
+
+
+def collect_usage(args):
+    """Bucket counted messages per the module docstring, oldest bucket first."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=args.days)
+    buckets = {}
+    for path, kind in usage_files(projects_root(), args.project):
+        for ts, model, units, context in usage_messages(path):
+            ts = (ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
+            if ts < cutoff:
+                continue
+            key = bucket_key(ts, args.by)
+            b = buckets.setdefault(key, {
+                "bucket": key, "units": 0.0, "requests": 0,
+                "main_units": 0.0, "subagent_units": 0.0,
+                "models": {fam: 0.0 for fam in MODEL_FAMILIES + ("other",)},
+                "_files": {"main": set(), "subagent": set()}, "_contexts": [],
+            })
+            b["units"] += units
+            b["requests"] += 1
+            b["main_units" if kind == "main" else "subagent_units"] += units
+            b["models"][model_family(model)] += units
+            b["_files"][kind].add(str(path))
+            b["_contexts"].append(context)
+    out = []
+    for key in sorted(buckets):
+        b = buckets.pop(key)
+        files = b.pop("_files")
+        contexts = b.pop("_contexts")
+        b["subagent_share"] = b["subagent_units"] / b["units"] if b["units"] else 0.0
+        b["main_files"] = len(files["main"])
+        b["subagent_files"] = len(files["subagent"])
+        b["median_context"] = statistics.median(contexts)
+        out.append(b)
+    return out
+
+
+def fmt_m(units):
+    return f"{units / 1e6:.1f}M"
+
+
+def fmt_ctx(n):
+    return f"{n / 1000:.1f}k" if n >= 1000 else str(round(n))
+
+
+def cmd_usage(args):
+    buckets = collect_usage(args)
+    if args.json:
+        print(json.dumps(buckets))
+        return
+    cols = [(10, "bucket"), (4, "req"), (7, "units"), (7, "main"), (7, "sub"), (5, "sub%"),
+            (7, "opus"), (7, "sonnet"), (7, "haiku"), (7, "other"), (4, "sess"), (6, "agents"), (7, "medctx")]
+    print(" ".join(f"{name:>{w}}" if i else f"{name:<{w}}" for i, (w, name) in enumerate(cols)))
+    widths = [w for w, _ in cols]
+    for b in buckets:
+        cells = [b["bucket"], b["requests"], *map(fmt_m, [b["units"], b["main_units"], b["subagent_units"]]),
+                 f"{b['subagent_share'] * 100:.0f}%", *map(fmt_m, (b["models"][f] for f in MODEL_FAMILIES + ("other",))),
+                 b["main_files"], b["subagent_files"], fmt_ctx(b["median_context"])]
+        print(" ".join(f"{c:<{widths[0]}}" if i == 0 else f"{c:>{widths[i]}}" for i, c in enumerate(cells)))
+    if not buckets:
+        print(f"(no usage in the last {args.days} days)")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -480,9 +620,14 @@ def main(argv=None):
     dp = sub.add_parser("digest", help="condensed transcript of one session")
     dp.add_argument("id", help="session id or unique prefix")
     dp.add_argument("--max-chars", type=int, default=15000)
+    up = sub.add_parser("usage", help="weighted token usage per day/week, main vs subagent, per model")
+    up.add_argument("--days", type=int, default=14, help="only messages from the last N days (UTC)")
+    up.add_argument("--by", choices=("day", "week"), default="day", help="bucket by UTC date or ISO week")
+    up.add_argument("--project", help="substring of the encoded project dir name")
+    up.add_argument("--json", action="store_true", help="machine-readable output")
 
     args = ap.parse_args(argv)
-    {"list": cmd_list, "search": cmd_search, "digest": cmd_digest}[args.cmd](args)
+    {"list": cmd_list, "search": cmd_search, "digest": cmd_digest, "usage": cmd_usage}[args.cmd](args)
 
 
 if __name__ == "__main__":
