@@ -79,9 +79,14 @@ It must not be able to:
      name too and only removes a file the check itself created.
 5. **Start the egress proxy, then launch the worker** with `sandbox-exec -f profile.sb <claude-realpath>` and an
    `env -i` environment holding exactly:
-   - `PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin`
+   - `PATH=/Library/Developer/CommandLineTools/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin`.
+     The CLT dir is hard-coded, first, and present only if it exists and is root-owned. The helper's own git keeps
+     `SAFE_PATH`.
    - `HOME=home`, `LANG`
-   - `TMPDIR`, `CLAUDE_CODE_TMPDIR` and `TMPPREFIX`, all set to `tmp`
+   - `TMPDIR` and `CLAUDE_CODE_TMPDIR`, both set to `tmp`, and `TMPPREFIX=tmp/zsh`
+   - registry settings (see "Registry proxy"): `PIP_INDEX_URL`, `PIP_TRUSTED_HOST`, `NPM_CONFIG_REGISTRY`,
+     `CARGO_HOME=home/.cargo`, `GOPROXY=off`, `GOFLAGS=-mod=mod`, `GOSUMDB=off`, `GOCACHE=tmp/gocache`, and
+     `GOMODCACHE` only when `--allow-read ~/go/pkg/mod` was passed
    - `CLAUDE_CONFIG_DIR=config`
    - `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`
    - `ANTHROPIC_BASE_URL=http://127.0.0.1:<proxy port>`, `ANTHROPIC_API_KEY=ollama`
@@ -96,8 +101,12 @@ It must not be able to:
    --tools Bash,Read,Edit,Write,Glob,Grep --allowedTools Bash,Read,Edit,Write,Glob,Grep
    --disallowedTools WebFetch,WebSearch,Agent,Skill --disable-slash-commands
    ```
-   - The brief goes on stdin, wrapped with a fixed preamble: "You are working in the current directory only. There is
-     no git and no network. Write the code and tests the brief asks for, run the tests, and finish with a short summary."
+   - Before the self-test the helper gives `src` a local git repo with a `base` commit (see "Worker-local git").
+     Before launch it writes `home/.cargo/config.toml` and `home/.m2/settings.xml`, pointing at the proxy.
+   - The brief goes on stdin, wrapped with a fixed preamble: "You are working in a copy of the repo, in the current
+     directory. git works locally: there is no remote. There is no network except the model. Make temp files with
+     `mktemp -d "$TMPDIR/x.XXXXXX"`. Write the code and tests the brief asks for, run the tests, commit if you like,
+     and finish with a short summary."
    - cwd is `src`. The helper runs it in its own process group, with a wall-clock timeout (default 45 min).
    - The helper reads the worker's stdout with `selectors` and a hard deadline. It stops reading at the deadline, or
      once the worker process has exited, regardless of EOF, because a daemonized child can hold the pipe open for
@@ -278,6 +287,143 @@ sandbox profile's only network allow is the proxy's loopback port, whatever the 
 6. Report to the user: what was built, the test output, the findings, the cost, and a recommendation.
    - Merging (`git merge offload/<slug>`) happens only after the user's explicit go-ahead.
    - `discard` happens only after confirmation.
+
+## Working like Claude (v0.3)
+
+Goal: the worker gets the shell, temp, Python and git behaviour Claude has in a repo, without new reach outside
+the run. The 2026-10-27 `recall-usage` run lost 8 of its 20 tool calls to sandbox friction. Every fix below was
+reproduced and then checked under that run's `profile.sb`.
+
+| Friction | Cause (verified) | Fix |
+|---|---|---|
+| `python3`/`git` print `couldn't create cache file .../xcrun_db-*` and git exits 128 | `/usr/bin/{python3,git}` are xcrun shims (see Known limitation) | Put `/Library/Developer/CommandLineTools/usr/bin` first on the **worker's** PATH. The CLT binaries ran clean under the profile: `tempfile.mkdtemp()` landed in `tmp`, and `git init` worked. The helper's own git keeps `SAFE_PATH`. |
+| zsh heredoc: `can't create temp file for here document` | `TMPPREFIX` is a file-name prefix, not a dir. `TMPPREFIX=<run>/tmp` makes `<run>/tmpXXXX`, which is outside the writable `tmp/` | `TMPPREFIX=<run>/tmp/zsh`. With that set, the heredoc worked. |
+| `mktemp -d` fails on `/var/folders/...` | macOS `mktemp` ignores `TMPDIR` without a template, and with `-t` too (both checked) | The preamble says: use `mktemp -d "$TMPDIR/x.XXXXXX"`. That form worked. Nothing is opened in `/var/folders`. |
+| `git status` → `not a git repository` | `src` is a `git archive` export with no `.git` | See below. |
+
+**Worker-local git.** Before the self-test, the helper runs `git init` on `src`, then `add -A` and a commit
+`base` through the safe-git wrapper. It uses `--git-dir src/.git --work-tree src`, so the safe-git config applies. The
+worker can then run `status`, `diff`, `log`, `commit` and `stash`. The repo has no remote and no network.
+- It cannot alias the helper's repo. `git/` stays unreadable to the worker, so no alternates or `--shared` setup is
+  possible, and the objects are copied.
+- It is the worker's own. Hooks and config the worker writes into `src/.git` run only in git commands the worker
+  starts, inside the sandbox. The helper never runs git against `src/.git` after launch.
+- Collection is unchanged. `commit_work` (offload.py:850) already deletes `src/.git` (dir, file or symlink) before
+  `git --git-dir=git --work-tree=src add -A`. The worker's commits are not used. What gets collected is the state of
+  the tree.
+- Not new: a nested `.git` in a subdirectory would be added as a gitlink. This was possible before (CLT or shim git
+  could `git init` a subdir). The review step flags it via `sensitive_paths`, because any part starting with `.git` is
+  flagged.
+
+**Preamble** becomes: "You are working in a copy of the repo, in the current directory. git works locally: there is no
+remote. There is no network except the model. Make temp files with `mktemp -d \"$TMPDIR/x.XXXXXX\"`. Write the code and
+tests the brief asks for, run the tests, commit if you like, and finish with a short summary."
+
+### Decisions (user decision 2026-10-27, board https://claude.ai/artifact/3xg7RnUkKizrMnJXBbHTAb)
+
+- **Web tools stay off.** `DENIED_TOOLS` is unchanged. Docs the worker needs go in the brief.
+- **`DEFAULT_MAX_TURNS` goes from 40 to 60.**
+- **Toolchain caches are readable by default, limited to public content** (narrowed after the Opus review, F3).
+  The default roots are `DEFAULT_READ_HOME = (".rustup", ".cargo/registry")`: toolchains and the crates.io index
+  and sources. Each is added on every run if it exists and passes `validate_allow_read`. A default root that fails
+  validation is skipped with a warning in the output; it does not fail the run.
+  - `~/go/pkg/mod` stays opt-in through `--allow-read`. Its download cache holds `github.com/...` modules, which may
+    include the owner's private repos (checked: `ls ~/go/pkg/mod/cache/download` lists github.com, gitlab.com, ...).
+    The same goes for `~/.cargo/git`, `~/.m2/repository`, `~/.gradle/caches` and `~/.npm/_cacache`, which may hold
+    private or registry-auth content. npm, pip, cargo and maven fetch through the registry proxy below instead.
+  - The threat model gains: "default reads are public-registry content only".
+- **Package registries are reachable through the proxy.** Details below.
+
+### Registry proxy (read-only reverse proxy)
+
+The worker's network reach is unchanged: one allow, `localhost:<proxy port>`, and no DNS. The v0.3 draft used
+CONNECT tunnels. The Opus review rejected that (F1, F2):
+- Every registry sits on Fastly or Cloudflare, so a tunnel to an allowed host can carry TLS for any site on that CDN.
+- `npm publish` is a PUT to the allowed npm host.
+
+There is no CONNECT and no `HTTPS_PROXY`. The helper makes every outbound TLS connection itself, so it sees and
+filters the HTTP.
+
+**Routes.** The existing proxy port gains `GET`/`HEAD` on fixed prefixes. Each prefix maps to a constant upstream:
+| Prefix | Upstream |
+|---|---|
+| `/r/pypi/` | `https://pypi.org/` |
+| `/r/pyfiles/` | `https://files.pythonhosted.org/` |
+| `/r/npm/` | `https://registry.npmjs.org/` |
+| `/r/crates-index/` | `https://index.crates.io/` |
+| `/r/crates-static/` | `https://static.crates.io/` |
+| `/r/maven/` | `https://repo.maven.apache.org/maven2/` |
+
+**Rules**, each one checked by a test:
+- **Methods.** Only `GET` and `HEAD` on a route. Any other method on `/r/` gets 403, and any request body is refused.
+  `POST /v1/messages` and `count_tokens` are unchanged. Anything else gets 403 and a line in `proxy_rejects.log`.
+- **Request target.** It must be origin-form, starting with `/`. An absolute URI or `CONNECT` gets 403.
+- **Path.** The rest of the path after the prefix is percent-decoded once. It is rejected if it contains `..`, `//`, a
+  backslash or a control character, and then it is re-quoted. The upstream URL is always
+  `<constant base><rest>[?query]`; the worker's string never picks a host.
+- **Upstream request.** It uses `http.client.HTTPSConnection(host, 443, context=ssl.create_default_context())`, with
+  the host taken from the table, so SNI and certificate checks are the real registry's.
+  - Request headers are rebuilt from scratch: `Host`, `User-Agent: offload`, `Accept`, `Accept-Encoding: identity`,
+    `If-None-Match` and `If-Modified-Since`. `Authorization`, `Cookie` and everything else are dropped.
+  - After DNS, every resolved address must satisfy `ipaddress.ip_address(a).is_global`, or the request gets a 502. The
+    helper connects to the vetted address, with no second lookup.
+- **Redirects** are not followed. A 3xx is passed back with `Location` rewritten only if it points at another
+  table upstream; otherwise it becomes a 502.
+- **Response rewrite.** This is needed because registries hand out absolute URLs:
+  - `/r/pypi/simple/...` (HTML and JSON): replace `https://files.pythonhosted.org/` with `<proxy>/r/pyfiles/`.
+  - `/r/npm/<pkg>` metadata: replace `https://registry.npmjs.org/` with `<proxy>/r/npm/`. Don't rely on npm's
+    `replace-registry-host`; that is unverified.
+  - `/r/crates-index/config.json`: set `dl` to `<proxy>/r/crates-static/crates` and `api` to null.
+  - Each rewrite is a plain string replace on a body capped at 64 MB; above that, 502. Other responses stream through
+    unchanged. Integrity hashes cover the package bytes, not the metadata URLs, so they still hold.
+- **Limits (F4).**
+  - Proxy-wide: at most 32 concurrent connections. Extra ones are accepted and closed at once, with a log line.
+  - Upstream: at most 8 concurrent `/r/` requests.
+  - Each client socket has a 30 s timeout and a 60 s deadline to read the full header.
+  - Per run: at most 4 GB of `/r/` downloads; beyond that, 403.
+  - `/v1/messages` keeps its own limits.
+
+**Worker environment.** `P` = `http://127.0.0.1:<port>`.
+- pip: `PIP_INDEX_URL=P/r/pypi/simple` and `PIP_TRUSTED_HOST=127.0.0.1`. The helper writes no pip config.
+- npm: `NPM_CONFIG_REGISTRY=P/r/npm/`. `npm_config_cache` goes in run `home`, which it already does.
+- cargo: `CARGO_HOME=<run>/home/.cargo` with a helper-written `config.toml`:
+  `[source.crates-io] replace-with="offload"` and `[source.offload] registry="sparse+P/r/crates-index/"`.
+  `CARGO_NET_OFFLINE` is unset. The real `~/.cargo/registry` is read-only; a cargo that reads it from another
+  `CARGO_HOME` is unverified, so builds download through the proxy.
+- maven: the helper writes `<run>/home/.m2/settings.xml` with a `<mirror>` of `*` to `P/r/maven/`. The local repo
+  is the run's own `~/.m2`.
+- go: `GOPROXY=off`, `GOFLAGS=-mod=mod`, `GOSUMDB=off`, `GOCACHE=<run>/tmp/gocache`.
+  - If `--allow-read ~/go/pkg/mod` was passed, also set `GOMODCACHE=<real path>`. A read-only module cache with
+    `-mod=mod` is unverified, and the build checks it.
+  - `proxy.golang.org` is never routed. It fetches any module path from any host on demand, so a request can carry
+    data to an attacker's host.
+
+**Residual risk, accepted** (unchanged in kind):
+- Path-encoded data in a GET reaches only the registry operator, never anything public, because writes are blocked.
+- Install scripts run inside the sandbox.
+- New dependencies land in the diff for review. `SENSITIVE_BASENAMES` gains `requirements.txt`, `Cargo.toml`,
+  `go.mod`, `pom.xml`, `build.gradle`, `build.gradle.kts`, `settings.gradle`, `settings.gradle.kts` and `.pypirc`,
+  and `SENSITIVE_PREFIXES` gains `requirements`. `build.gradle` runs code on the host the same way `Makefile` does,
+  so it should already have been flagged.
+
+**Self-test gains** (F8):
+- `CONNECT pypi.org:443` gets 403.
+- `GET http://example.com/` in absolute form gets 403.
+- `PUT /r/npm/x` gets 403.
+- `GET /r/pypi/../../x` and `GET /r/nope/` get 403.
+- `GET /r/pypi/simple/pip/` gets 200 and a body with no `files.pythonhosted.org`. This one is skipped when offline.
+- The 33rd concurrent connection is closed.
+
+### Worker-local git: helper rules (F7)
+
+After launch, the helper touches `src/.git` only to delete it in `commit_work`. No helper git command uses `src` as
+a git dir, or runs with `-C src`. The helper's `add -A` already runs with `core.attributesFile=/dev/null`. Its config
+is the helper's bare repo config, which defines no `filter.*`, so a worker `.gitattributes` naming a filter has nothing
+to run. A test asserts that `src/.git` is gone before `add -A`. Survivors recreating `.git` in the gap stay a known,
+low risk: nested repos are flagged by `sensitive_paths`, and a root `.git` is a gitlink the review sees.
+
+The CLT dir is hard-coded as `/Library/Developer/CommandLineTools/usr/bin`, never taken from `xcode-select -p`, and
+added only if it exists and is root-owned.
 
 ## Evidence
 

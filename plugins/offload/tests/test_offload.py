@@ -174,10 +174,13 @@ def test_worker_env_exact_keys_and_no_inherited_token(monkeypatch):
         "PATH", "HOME", "LANG", "TMPDIR", "CLAUDE_CODE_TMPDIR", "TMPPREFIX", "CLAUDE_CONFIG_DIR",
         "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL",
         "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "MAX_THINKING_TOKENS"}
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "MAX_THINKING_TOKENS",
+        "PIP_INDEX_URL", "PIP_TRUSTED_HOST", "NPM_CONFIG_REGISTRY", "CARGO_HOME", "GOPROXY", "GOFLAGS",
+        "GOSUMDB", "GOCACHE"}
     assert "ANTHROPIC_AUTH_TOKEN" not in env
     assert env["ANTHROPIC_BASE_URL"] == "http://localhost:11434"
-    assert env["HOME"] == "/r/home" and env["TMPDIR"] == "/r/tmp" == env["CLAUDE_CODE_TMPDIR"] == env["TMPPREFIX"]
+    assert env["HOME"] == "/r/home" and env["TMPDIR"] == "/r/tmp" == env["CLAUDE_CODE_TMPDIR"]
+    assert env["TMPPREFIX"] == "/r/tmp/zsh"
     assert env["MAX_THINKING_TOKENS"] == "8000"
     assert all(env[k] == "kimi-k3:cloud" for k in env if k.startswith("ANTHROPIC_") and "MODEL" in k)
 
@@ -605,10 +608,12 @@ def test_integration_selftest_passes_and_isolation(tmp_path, repo):
     try:
         ctx["proxy_port"] = px.start()
         offload.write_profile(ctx, ctx["proxy_port"])
-        ok, results = offload.run_selftest(ctx)
+        ok, results = offload.run_selftest(ctx, online=False)
         assert ok, results
         names = " | ".join(r["check"] for r in results)
-        for needle in ("proxy answers 403", "direct connect to localhost:11434", "pbpaste", "DNS lookup"):
+        for needle in ("proxy answers 403", "direct connect to localhost:11434", "pbpaste", "DNS lookup",
+                       "CONNECT pypi.org:443", "absolute-form GET", "PUT /r/npm/x", "/r/pypi/../../x",
+                       "/r/nope/", "(offline, skipped)", "33rd concurrent"):
             assert needle in names, names
         assert up.seen == []
         assert "/api/pull" in (Path(ctx["run_dir"]) / "proxy_rejects.log").read_text()
@@ -943,3 +948,494 @@ def test_launch_worker_status_running_and_tool_calls(monkeypatch, tmp_path):
     assert ctx["record"]["last_activity_at"] >= seen[0]["started_at"]
     assert _read_run_json(run_dir)["tool_calls"] >= 1  # at least the first (unthrottled) write landed
     assert [f for f in os.listdir(run_dir) if f.startswith("run.json")] == ["run.json"]
+
+
+# ================================================================== v0.3: working like Claude
+
+import http.client  # noqa: E402
+import http.server  # noqa: E402
+import socket  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
+
+
+# ------------------------------------------------------------------ worker env, PATH, preamble, turns
+
+def test_defaults_v03():
+    assert offload.DEFAULT_MAX_TURNS == 60
+    assert offload.build_parser().parse_args(["run", "--repo", "r", "--brief", "b"]).max_turns == 60
+    assert offload.DEFAULT_READ_HOME == (".rustup", ".cargo/registry")
+    assert offload.WORKER_PREAMBLE == (
+        "You are working in a copy of the repo, in the current directory. git works locally: there is no remote. "
+        "There is no network except the model. Make temp files with `mktemp -d \"$TMPDIR/x.XXXXXX\"`. Write the "
+        "code and tests the brief asks for, run the tests, commit if you like, and finish with a short summary.\n\n")
+
+
+def test_clt_first_on_worker_path_only_when_root_owned(monkeypatch, tmp_path):
+    monkeypatch.setattr(offload, "CLT_BIN", "/usr/bin")  # exists and is root-owned
+    env = offload.build_worker_env("/r", "m", "http://127.0.0.1:1")
+    assert env["PATH"] == f"/usr/bin:{offload.SAFE_PATH}"
+    monkeypatch.setattr(offload, "CLT_BIN", str(tmp_path))  # exists, owned by the test user
+    assert offload.build_worker_env("/r", "m", "http://127.0.0.1:1")["PATH"] == offload.SAFE_PATH
+    monkeypatch.setattr(offload, "CLT_BIN", str(tmp_path / "missing"))
+    assert offload.build_worker_env("/r", "m", "http://127.0.0.1:1")["PATH"] == offload.SAFE_PATH
+    # the helper's own git keeps SAFE_PATH
+    assert f"PATH={offload.SAFE_PATH}" in offload.safe_git_argv(["status"], "/h", git_bin="/usr/bin/git")
+
+
+def test_clt_constant_is_hardcoded():
+    src = Path(offload.__file__).read_text()
+    assert "xcode-select" not in src.replace("never taken from `xcode-select -p`", "")
+    assert "/Library/Developer/CommandLineTools/usr/bin" in src
+
+
+def test_registry_env_points_at_proxy():
+    env = offload.build_worker_env("/r", "m", "http://127.0.0.1:5555")
+    assert env["PIP_INDEX_URL"] == "http://127.0.0.1:5555/r/pypi/simple" and env["PIP_TRUSTED_HOST"] == "127.0.0.1"
+    assert env["NPM_CONFIG_REGISTRY"] == "http://127.0.0.1:5555/r/npm/"
+    assert env["CARGO_HOME"] == "/r/home/.cargo"
+    assert (env["GOPROXY"], env["GOFLAGS"], env["GOSUMDB"], env["GOCACHE"]) == ("off", "-mod=mod", "off", "/r/tmp/gocache")
+    assert "GOMODCACHE" not in env and "CARGO_NET_OFFLINE" not in env
+    assert not [k for k in env if k.upper() in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY")]
+    assert "HTTPS_PROXY" not in Path(offload.__file__).read_text()
+
+
+def test_gomodcache_only_when_allowed(tmp_path):
+    mod = os.path.realpath(os.path.join(HOME, "go", "pkg", "mod"))
+    env = offload.build_worker_env("/r", "m", "http://127.0.0.1:1", allow_read=[mod])
+    assert env["GOMODCACHE"] == mod
+    other = offload.build_worker_env("/r", "m", "http://127.0.0.1:1", allow_read=[str(tmp_path)])
+    assert "GOMODCACHE" not in other
+
+
+def test_write_registry_configs(tmp_path):
+    offload.write_registry_configs(str(tmp_path), "http://127.0.0.1:5555")
+    cargo = (tmp_path / "home" / ".cargo" / "config.toml").read_text()
+    assert 'replace-with = "offload"' in cargo and 'registry = "sparse+http://127.0.0.1:5555/r/crates-index/"' in cargo
+    mvn = (tmp_path / "home" / ".m2" / "settings.xml").read_text()
+    assert "<mirrorOf>*</mirrorOf>" in mvn and "<url>http://127.0.0.1:5555/r/maven/</url>" in mvn
+
+
+@needs_sandbox
+@pytest.mark.skipif(not os.path.isdir(offload.CLT_BIN), reason="needs the Command Line Tools")
+def test_integration_worker_shell_python_git_and_temp(tmp_path, repo):
+    _, ctx = prepare(tmp_path, repo)
+    env = offload.build_worker_env(ctx["run_dir"], "m", "http://127.0.0.1:1")
+    offload.write_profile(ctx)
+
+    def sb(*argv):
+        return subprocess.run(["/usr/bin/sandbox-exec", "-f", ctx["profile"], *argv], cwd=ctx["src"], env=env,
+                              capture_output=True, text=True, timeout=60)
+    r = sb("/bin/zsh", "-c", "cat <<EOF\nheredoc ok\nEOF")
+    assert r.returncode == 0 and "heredoc ok" in r.stdout, r.stderr
+    r = sb("/bin/sh", "-c", 'mktemp -d "$TMPDIR/x.XXXXXX"')
+    assert r.returncode == 0 and r.stdout.strip().startswith(os.path.join(ctx["run_dir"], "tmp") + "/x."), r.stderr
+    r = sb("/bin/sh", "-c", "command -v python3 git; python3 -c 'import tempfile; print(tempfile.mkdtemp())'")
+    assert r.returncode == 0 and offload.CLT_BIN + "/python3" in r.stdout and "xcrun" not in r.stderr, r.stderr
+    offload.init_worker_git(ctx)
+    r = sb("/bin/sh", "-c", "git status --short; git log --format=%s; echo x > n.txt; git add n.txt; "
+                            "git commit -qm worker && git log --format=%s")
+    assert r.returncode == 0 and "base" in r.stdout and "worker" in r.stdout and "xcrun" not in r.stderr, r.stderr
+
+
+# ------------------------------------------------------------------ default read roots
+
+def test_default_read_roots_skip_with_warning(tmp_path):
+    home, outside = tmp_path / "h", tmp_path / "outside"
+    for d in (home, outside, home / ".rustup"):
+        d.mkdir(parents=True)
+    (home / ".cargo").mkdir()
+    (home / ".cargo" / "registry").symlink_to(outside)  # leaves $HOME: fails validation
+    roots, warnings = offload.default_read_roots(home=str(home))
+    assert roots == [os.path.realpath(home / ".rustup")]
+    assert len(warnings) == 1 and ".cargo/registry" in warnings[0]
+    assert offload.default_read_roots(home=str(tmp_path / "empty")) == ([], [])  # absent roots are silent
+
+
+def test_default_read_roots_both_present(tmp_path):
+    (tmp_path / ".rustup").mkdir()
+    (tmp_path / ".cargo" / "registry").mkdir(parents=True)
+    (tmp_path / ".cargo" / "git").mkdir()
+    roots, warnings = offload.default_read_roots(home=str(tmp_path))
+    assert sorted(roots) == sorted(os.path.realpath(tmp_path / d) for d in (".rustup", ".cargo/registry"))
+    assert warnings == []  # .cargo/git is opt-in, never a default
+
+
+def test_prepare_run_adds_defaults_and_keeps_warnings(tmp_path, repo, monkeypatch):
+    extra = os.path.realpath(tmp_path / "d")
+    os.mkdir(extra)
+    monkeypatch.setattr(offload, "default_read_roots", lambda home=None, repo_root=None: ([extra], ["w1"]))
+    _, ctx = prepare(tmp_path, repo)
+    assert extra in ctx["allow_read"] and ctx["warnings"] == ["w1"]
+    assert ctx["record"]["warnings"] == ["w1"] and extra in ctx["record"]["allow_read"]
+    assert f'(subpath "{extra}")' in Path(ctx["profile"]).read_text()
+
+
+# ------------------------------------------------------------------ worker-local git, commit_work
+
+def test_init_worker_git_and_commit_work_removes_it_first(tmp_path, repo, monkeypatch):
+    _, ctx = prepare(tmp_path, repo)
+    src = Path(ctx["src"])
+    offload.init_worker_git(ctx)
+    assert (src / ".git").is_dir()
+    assert git(src, "log", "--format=%s").strip() == "base"
+    assert git(src, "status", "--porcelain").strip() == ""
+    assert git(src, "config", "user.name").strip() == "offload"
+    (src / "new.txt").write_text("n\n")
+    seen = []
+    real = offload.safe_git
+
+    def spy(args, home, *a, **k):
+        if "add" in args:
+            seen.append((src / ".git").exists() or (src / ".git").is_symlink())
+        return real(args, home, *a, **k)
+    monkeypatch.setattr(offload, "safe_git", spy)
+    offload.commit_work(ctx)
+    assert seen == [False]  # src/.git was gone before `add -A`
+    assert not (src / ".git").exists()
+    assert "new.txt" in git(ctx["git_dir"], "show", "--stat", "--format=", "work")
+
+
+def test_commit_work_removes_symlink_or_file_dot_git(tmp_path, repo):
+    _, ctx = prepare(tmp_path, repo)
+    src = Path(ctx["src"])
+    (src / ".git").symlink_to(tmp_path)
+    offload.commit_work(ctx)
+    assert not os.path.lexists(src / ".git")
+
+
+# ------------------------------------------------------------------ sensitive paths
+
+def test_sensitive_paths_v03_additions():
+    names = ["requirements.txt", "Cargo.toml", "go.mod", "pom.xml", "build.gradle", "build.gradle.kts",
+             "settings.gradle", "settings.gradle.kts", ".pypirc", "sub/requirements-dev.txt"]
+    assert offload.sensitive_paths(names + ["plain.py", "README.md"]) == names
+
+
+# ------------------------------------------------------------------ registry proxy
+
+class FakeRegistry:
+    """A local plain-HTTP upstream. `pages` maps a path to (status, headers, body)."""
+
+    def __init__(self, delay=0.0):
+        self.seen = []
+        self.pages = {}
+        self.active = self.peak = 0
+        self.delay = delay
+        self._lock = threading.Lock()
+        reg = self
+
+        class H(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def _any(self):
+                with reg._lock:
+                    reg.active += 1
+                    reg.peak = max(reg.peak, reg.active)
+                    reg.seen.append((self.command, self.path, dict(self.headers)))
+                try:
+                    time.sleep(reg.delay)
+                    status, hdrs, body = reg.pages.get(self.path.split("?")[0], (404, {}, b"nope"))
+                    self.send_response(status)
+                    for k, v in hdrs.items():
+                        self.send_header(k, v)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    if self.command != "HEAD":
+                        self.wfile.write(body)
+                finally:
+                    with reg._lock:
+                        reg.active -= 1
+
+            do_GET = do_HEAD = _any
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.port = self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+def fake_connector(reg):
+    return lambda host, port, scheme: http.client.HTTPConnection("127.0.0.1", reg.port, timeout=10)
+
+
+def test_routes_in_design_table():
+    assert offload.REGISTRY_ROUTES == {
+        "/r/pypi/": "https://pypi.org/", "/r/pyfiles/": "https://files.pythonhosted.org/",
+        "/r/npm/": "https://registry.npmjs.org/", "/r/crates-index/": "https://index.crates.io/",
+        "/r/crates-static/": "https://static.crates.io/", "/r/maven/": "https://repo.maven.apache.org/maven2/"}
+    assert (offload.PROXY_MAX_CONNS, offload.PROXY_MAX_UPSTREAM) == (32, 8)
+    assert (offload.PROXY_CLIENT_TIMEOUT, offload.PROXY_HEADER_DEADLINE) == (30, 60)
+    assert offload.PROXY_RUN_BUDGET == 4 * 1024 ** 3 and offload.PROXY_REWRITE_CAP == 64 * 1024 * 1024
+
+
+@pytest.fixture
+def reg_proxy(tmp_path):
+    reg = FakeRegistry()
+    made = []
+
+    def make(**kw):
+        routes = kw.pop("routes", None) or {
+            "/r/pypi/": f"http://127.0.0.1:{reg.port}/", "/r/pyfiles/": f"http://localhost:{reg.port}/",
+            "/r/npm/": f"http://127.0.0.1:{reg.port}/npm/", "/r/crates-index/": f"http://127.0.0.1:{reg.port}/idx/",
+            "/r/crates-static/": f"http://localhost:{reg.port}/static/"}
+        px = offload.EgressProxy("http://127.0.0.1:9", str(tmp_path / "rej.log"), routes=routes,
+                                 connector=kw.pop("connector", fake_connector(reg)), **kw)
+        made.append(px)
+        return px, px.start()
+    yield reg, make, tmp_path / "rej.log"
+    for px in made:
+        px.stop()
+    reg.close()
+
+
+def get(port, path, method="GET", headers=None, body=None):
+    c, r = http_req(port, method, path, body, headers)
+    data = r.read()
+    c.close()
+    return r, data
+
+
+def test_registry_get_rebuilds_headers_and_rewrites_pypi(reg_proxy):
+    reg, make, log = reg_proxy
+    px, port = make()
+    reg.pages["/simple/pip/"] = (200, {"Content-Type": "text/html"},
+                                 b'<a href="https://files.pythonhosted.org/packages/ab/pip-1.whl">x</a>')
+    r, data = get(port, "/r/pypi/simple/pip/?x=1", headers={
+        "Authorization": "Bearer s", "Cookie": "c=1", "X-Evil": "1", "Accept": "text/html",
+        "Accept-Encoding": "gzip", "If-None-Match": '"e"', "If-Modified-Since": "Mon, 01 Jan 2024 00:00:00 GMT"})
+    assert r.status == 200 and r.getheader("Content-Length") == str(len(data))
+    assert data == f'<a href="http://127.0.0.1:{port}/r/pyfiles/packages/ab/pip-1.whl">x</a>'.encode()
+    method, path, hdrs = reg.seen[0]
+    assert (method, path) == ("GET", "/simple/pip/?x=1")
+    low = {k.lower(): v for k, v in hdrs.items()}
+    assert set(low) == {"host", "user-agent", "accept", "accept-encoding", "if-none-match", "if-modified-since",
+                        "connection"}
+    assert low["user-agent"] == "offload" and low["accept-encoding"] == "identity" and low["accept"] == "text/html"
+    assert not log.exists()
+
+
+def test_registry_rewrites_npm_crates_and_streams_binaries(reg_proxy):
+    reg, make, _ = reg_proxy
+    px, port = make()
+    reg.pages["/npm/left-pad"] = (200, {"Content-Type": "application/vnd.npm.install-v1+json"},
+                                  b'{"tarball":"https://registry.npmjs.org/left-pad/-/left-pad-1.tgz"}')
+    r, data = get(port, "/r/npm/left-pad")
+    assert data == f'{{"tarball":"http://127.0.0.1:{port}/r/npm/left-pad/-/left-pad-1.tgz"}}'.encode()
+    reg.pages["/idx/config.json"] = (200, {"Content-Type": "application/json"},
+                                     b'{"dl":"https://static.crates.io/crates","api":"https://crates.io"}')
+    r, data = get(port, "/r/crates-index/config.json")
+    assert json.loads(data) == {"dl": f"http://127.0.0.1:{port}/r/crates-static/crates", "api": None}
+    blob = b"https://registry.npmjs.org/ stays\x00"
+    reg.pages["/npm/left-pad/-/left-pad-1.tgz"] = (200, {"Content-Type": "application/octet-stream"}, blob)
+    r, data = get(port, "/r/npm/left-pad/-/left-pad-1.tgz")
+    assert data == blob  # not rewritten
+    r, data = get(port, "/r/npm/left-pad/-/left-pad-1.tgz", method="HEAD")
+    assert r.status == 200 and data == b"" and r.getheader("Content-Length") == str(len(blob))
+
+
+@pytest.mark.parametrize("method", ["PUT", "POST", "DELETE", "PATCH", "CONNECT", "OPTIONS", "FOO"])
+def test_registry_other_methods_403(reg_proxy, method):
+    reg, make, log = reg_proxy
+    px, port = make()
+    c, r = http_req(port, method, "/r/npm/x", b"{}" if method in ("PUT", "POST", "PATCH") else None)
+    assert r.status == 403
+    c.close()
+    assert reg.seen == [] and method in log.read_text()
+
+
+def test_registry_connect_authority_form_403(reg_proxy):
+    reg, make, log = reg_proxy
+    px, port = make()
+    c, r = http_req(port, "CONNECT", "pypi.org:443")
+    assert r.status == 403
+    c.close()
+    assert reg.seen == []
+
+
+def test_registry_get_with_body_refused(reg_proxy):
+    reg, make, _ = reg_proxy
+    px, port = make()
+    r, _ = get(port, "/r/pypi/simple/pip/", body=b"data", headers={"Content-Length": "4"})
+    assert r.status == 403
+    r, _ = get(port, "/r/pypi/simple/pip/", headers={"Transfer-Encoding": "chunked"})
+    assert r.status == 403
+    assert reg.seen == []
+
+
+@pytest.mark.parametrize("target", [
+    "http://pypi.org/simple/pip/", "http://example.com/", "https://evil.example/r/pypi/simple/",
+    "/r/pypi/../../x", "/r/pypi/a/../b", "/r/pypi/a//b", "/r/pypi/a%2e%2e/b", "/r/pypi/%2e%2e%2fx",
+    "/r/pypi/a%5cb", "/r/pypi/a\\b", "/r/pypi/a%00b", "/r/pypi/a%0ab", "/r/pypi/%ff", "/r/nope/", "/r/pypi",
+    "/r/", "/r", "/R/pypi/simple/", "/v1/messages", "/r/pypi/x?a=\\b", "/r/pypi/x?a=\x01"])
+def test_registry_path_and_target_rules_403(reg_proxy, target):
+    reg, make, log = reg_proxy
+    px, port = make()
+    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    s.sendall(f"GET {target} HTTP/1.1\r\nHost: x\r\n\r\n".encode("latin-1"))
+    status = s.recv(100).split(b"\r\n")[0]
+    s.close()
+    assert b" 403 " in status, status
+    assert reg.seen == []
+
+
+def test_registry_upstream_url_is_constant_base_plus_requoted_rest(reg_proxy):
+    reg, make, _ = reg_proxy
+    px, port = make()
+    reg.pages["/simple/a%20b/@evil.com/"] = (200, {"Content-Type": "text/plain"}, b"ok")
+    r, data = get(port, "/r/pypi/simple/a%20b/@evil.com/")
+    assert r.status == 200 and data == b"ok"
+    assert reg.seen[0][1] == "/simple/a%20b/@evil.com/"
+    assert reg.seen[0][2]["Host"] == f"127.0.0.1:{reg.port}"  # the table's host, never the worker's
+    r, _ = get(port, "/r/pypi/simple/x/", headers={"Host": "evil.example"})
+    assert reg.seen[-1][2]["Host"] == f"127.0.0.1:{reg.port}"
+
+
+def test_registry_redirects_rewritten_or_502(reg_proxy):
+    reg, make, _ = reg_proxy
+    px, port = make()
+    reg.pages["/to-files"] = (302, {"Location": f"http://localhost:{reg.port}/packages/p.whl"}, b"")
+    reg.pages["/to-evil"] = (302, {"Location": "https://evil.example/x"}, b"")
+    reg.pages["/relative"] = (301, {"Location": "/simple/pip/"}, b"")
+    r, _ = get(port, "/r/pypi/to-files")
+    assert r.status == 302 and r.getheader("Location") == f"http://127.0.0.1:{port}/r/pyfiles/packages/p.whl"
+    r, _ = get(port, "/r/pypi/to-evil")
+    assert r.status == 502 and r.getheader("Location") is None
+    r, _ = get(port, "/r/pypi/relative")
+    assert r.status == 301 and r.getheader("Location") == f"http://127.0.0.1:{port}/r/pypi/simple/pip/"
+    assert len(reg.seen) == 3  # nothing followed
+
+
+def test_registry_non_global_address_is_502():
+    def fake(addr):
+        return lambda host, port, **kw: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (addr, port))]
+    for bad in ("10.0.0.5", "127.0.0.1", "169.254.169.254", "192.168.1.1", "100.64.0.1"):
+        with pytest.raises(offload.UpstreamBlocked):
+            offload.connect_registry("pypi.org", resolver=fake(bad))
+    mixed = lambda host, port, **kw: [(2, 1, 6, "", ("8.8.8.8", port)), (2, 1, 6, "", ("10.0.0.5", port))]
+    with pytest.raises(offload.UpstreamBlocked):
+        offload.connect_registry("pypi.org", resolver=mixed)
+    v6 = lambda host, port, **kw: [(socket.AF_INET6, 1, 6, "", ("::1", port, 0, 0))]
+    with pytest.raises(offload.UpstreamBlocked):
+        offload.connect_registry("pypi.org", resolver=v6)
+    conn = offload.connect_registry("pypi.org", resolver=fake("151.101.0.223"))
+    assert conn.host == "pypi.org" and conn.port == 443  # not connected yet; SNI/verification name is the host
+
+
+def test_registry_proxy_returns_502_for_blocked_address(reg_proxy):
+    reg, make, _ = reg_proxy
+    private = lambda host, port, **kw: [(2, 1, 6, "", ("10.0.0.5", port))]
+    px, port = make(connector=lambda h, p, s: offload.connect_registry(h, p, resolver=private))
+    r, _ = get(port, "/r/pypi/simple/pip/")
+    assert r.status == 502 and reg.seen == []
+
+
+def test_registry_rewrite_cap_and_other_responses_stream(reg_proxy):
+    reg, make, _ = reg_proxy
+    px, port = make(rewrite_cap=50)
+    reg.pages["/simple/big/"] = (200, {"Content-Type": "text/html"}, b"x" * 51)
+    reg.pages["/simple/ok/"] = (200, {"Content-Type": "text/html"}, b"x" * 50)
+    reg.pages["/blob"] = (200, {"Content-Type": "application/octet-stream"}, b"y" * 500)
+    assert get(port, "/r/pypi/simple/big/")[0].status == 502
+    assert get(port, "/r/pypi/simple/ok/")[0].status == 200
+    r, data = get(port, "/r/pypi/blob")
+    assert r.status == 200 and data == b"y" * 500
+
+
+def test_registry_run_download_budget(reg_proxy):
+    reg, make, log = reg_proxy
+    px, port = make(run_budget=100)
+    reg.pages["/blob"] = (200, {"Content-Type": "application/octet-stream"}, b"z" * 80)
+    assert get(port, "/r/pypi/blob")[0].status == 200
+    assert get(port, "/r/pypi/blob")[0].status == 200  # 80 < 100 when it started
+    r, _ = get(port, "/r/pypi/blob")
+    assert r.status == 403 and len(reg.seen) == 2 and "budget" in log.read_text()
+    assert get(port, "/v1/messages")[0].status == 403  # unrelated rules unchanged
+
+
+def test_proxy_connection_cap_closes_extras_and_logs(reg_proxy):
+    reg, make, log = reg_proxy
+    px, port = make(max_conns=4)
+    held = [socket.create_connection(("127.0.0.1", port), timeout=3) for _ in range(4)]
+    time.sleep(0.2)
+    extra = socket.create_connection(("127.0.0.1", port), timeout=3)
+    assert extra.recv(1) == b""  # accepted and closed at once
+    extra.close()
+    assert "connection limit" in log.read_text()
+    held.pop().close()
+    time.sleep(0.3)
+    reg.pages["/simple/pip/"] = (200, {"Content-Type": "text/plain"}, b"ok")
+    assert get(port, "/r/pypi/simple/pip/")[1] == b"ok"  # a freed slot works again
+    for c in held:
+        c.close()
+
+
+def test_registry_upstream_concurrency_cap():
+    reg = FakeRegistry(delay=0.3)
+    reg.pages["/blob"] = (200, {"Content-Type": "application/octet-stream"}, b"b")
+    tmp = Path(__import__("tempfile").mkdtemp())
+    px = offload.EgressProxy("http://127.0.0.1:9", str(tmp / "l"), routes={"/r/pypi/": f"http://127.0.0.1:{reg.port}/"},
+                             connector=fake_connector(reg), max_upstream=2)
+    port = px.start()
+    try:
+        results = []
+        ts = [threading.Thread(target=lambda: results.append(get(port, "/r/pypi/blob")[0].status)) for _ in range(6)]
+        [t.start() for t in ts]
+        [t.join(20) for t in ts]
+        assert results == [200] * 6 and reg.peak <= 2
+    finally:
+        px.stop()
+        reg.close()
+
+
+def test_proxy_header_deadline_closes_slow_client(reg_proxy):
+    reg, make, _ = reg_proxy
+    px, port = make(header_deadline=0.5)
+    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    s.sendall(b"GET /r/pypi/simple/pip/ HTTP/1.1\r\nHost: x\r\n")  # headers never finish
+    t0 = time.monotonic()
+    assert s.recv(10) == b""
+    assert time.monotonic() - t0 < 4
+    s.close()
+    assert reg.seen == []
+
+
+def test_proxy_client_socket_timeout_is_30s():
+    px = offload.EgressProxy("http://127.0.0.1:9", os.devnull)
+    try:
+        assert px.httpd.RequestHandlerClass.timeout == 30
+    finally:
+        px.httpd.server_close()
+
+
+@needs_sandbox
+def test_integration_cmd_run_inits_worker_git_writes_configs_and_reports_warnings(tmp_path, repo, monkeypatch, capsys):
+    ohome = os.path.realpath(tmp_path / "ohome")
+    brief = tmp_path / "brief.md"
+    brief.write_text("do it\n")
+    seen = {}
+    monkeypatch.setattr(offload, "resolve_claude", lambda allow=False: fake_claude())
+    monkeypatch.setattr(offload, "default_read_roots", lambda home=None, repo_root=None: ([], ["default root skipped"]))
+    monkeypatch.setattr(offload, "run_selftest", lambda c: (True, []))
+
+    def fake_launch(ctx, brief_text, timeout_s):
+        src, home = Path(ctx["src"]), Path(ctx["run_dir"]) / "home"
+        seen["log"] = git(src, "log", "--format=%s").strip()
+        seen["cargo"] = (home / ".cargo" / "config.toml").read_text()
+        seen["mvn"] = (home / ".m2" / "settings.xml").read_text()
+        seen["port"] = ctx["proxy_port"]
+        return {"init_problems": [], "saw_init": True, "timed_out": False, "result": {"is_error": False}, "usage": {},
+                "text": "", "returncode": 0, "turns": 1, "survivors_killed": []}
+    monkeypatch.setattr(offload, "launch_worker", fake_launch)
+    assert offload.main(["--home", ohome, "run", "--repo", str(repo), "--brief", str(brief), "--slug", "job"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["warnings"] == ["default root skipped"] and out["status"] == "ok"
+    assert seen["log"] == "base"
+    assert f"sparse+http://127.0.0.1:{seen['port']}/r/crates-index/" in seen["cargo"]
+    assert f"http://127.0.0.1:{seen['port']}/r/maven/" in seen["mvn"]
