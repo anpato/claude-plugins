@@ -77,6 +77,49 @@ REGISTRY_ROUTES = {
     "/r/crates-static/": "https://static.crates.io/",
     "/r/maven/": "https://repo.maven.apache.org/maven2/",
 }
+# `run --registries` names -> routes served (user decision 2026-10-27: off by default, enabled per run)
+REGISTRY_GROUPS = {
+    "pypi": ("/r/pypi/", "/r/pyfiles/"),
+    "npm": ("/r/npm/",),
+    "crates": ("/r/crates-index/", "/r/crates-static/"),
+    "maven": ("/r/maven/",),
+}
+
+
+def parse_registries(value):
+    """'pypi,npm' -> ['npm', 'pypi'] (canonical order); an unknown name is an error before any spend."""
+    names = [n.strip() for n in (value or "").split(",") if n.strip()]
+    bad = [n for n in names if n not in REGISTRY_GROUPS]
+    if bad or (value and not names):
+        raise OffloadError(f"unknown registry {bad or value!r}; choose from {', '.join(REGISTRY_GROUPS)}")
+    return [n for n in REGISTRY_GROUPS if n in names]
+
+
+def registry_package(prefix, rest):
+    """The package a /r/ request is for, taken from the decoded path after the route prefix ('' if none)."""
+    parts = [s for s in rest.split("/") if s]
+    if not parts:
+        return ""
+    if prefix == "/r/pypi/":
+        name = parts[1] if parts[0] == "simple" and len(parts) > 1 else (parts[0] if parts[0] != "simple" else "")
+    elif prefix == "/r/pyfiles/":
+        m = re.match(r"(.+?)-\d", parts[-1])
+        name = m.group(1) if m else parts[-1]
+    elif prefix == "/r/npm/":
+        name = "/".join(parts[:2]) if parts[0].startswith("@") and len(parts) > 1 else parts[0]
+    elif prefix == "/r/crates-static/":
+        name = parts[1] if parts[0] == "crates" and len(parts) > 1 else ""
+    elif prefix == "/r/crates-index/":
+        name = "" if rest == "config.json" else parts[-1]
+    elif prefix == "/r/maven/":
+        if "." in parts[-1]:
+            parts = parts[:-1]
+        if len(parts) > 1 and re.match(r"\d", parts[-1]):
+            parts = parts[:-1]
+        name = "/".join(parts)
+    else:
+        name = parts[0]
+    return name
 PROXY_MAX_CONNS = 32
 PROXY_MAX_UPSTREAM = 8
 PROXY_CLIENT_TIMEOUT = 30
@@ -311,7 +354,8 @@ def go_modcache(allow_read, home=None):
     return root if any(os.path.realpath(p) == root for p in allow_read) else None
 
 
-def build_worker_env(run_dir, model, base_url, max_thinking=DEFAULT_MAX_THINKING, lang=None, allow_read=()):
+def build_worker_env(run_dir, model, base_url, max_thinking=DEFAULT_MAX_THINKING, lang=None, allow_read=(),
+                     registries=()):
     """Exactly the spec's key set. Nothing is inherited from os.environ except an optional LANG.
 
     base_url is the local proxy (P); the registry settings point at P/r/... and work only while it is up."""
@@ -330,32 +374,36 @@ def build_worker_env(run_dir, model, base_url, max_thinking=DEFAULT_MAX_THINKING
         "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
         "MAX_THINKING_TOKENS": str(int(max_thinking)),
-        # package registries, through the proxy's read-only routes
-        "PIP_INDEX_URL": f"{base_url}/r/pypi/simple", "PIP_TRUSTED_HOST": "127.0.0.1",
-        "NPM_CONFIG_REGISTRY": f"{base_url}/r/npm/",
         "CARGO_HOME": os.path.join(run_dir, "home", ".cargo"),
         "GOPROXY": "off", "GOFLAGS": "-mod=mod", "GOSUMDB": "off", "GOCACHE": os.path.join(tmp, "gocache"),
     }
+    # package registries, through the proxy's read-only routes, only for the ones enabled for this run
+    if "pypi" in registries:
+        env.update(PIP_INDEX_URL=f"{base_url}/r/pypi/simple", PIP_TRUSTED_HOST="127.0.0.1")
+    if "npm" in registries:
+        env["NPM_CONFIG_REGISTRY"] = f"{base_url}/r/npm/"
     mod = go_modcache(allow_read)
     if mod:
         env["GOMODCACHE"] = mod
     return env
 
 
-def write_registry_configs(run_dir, proxy_url):
+def write_registry_configs(run_dir, proxy_url, registries=()):
     """Helper-written cargo config and maven settings, both pointing at the proxy (run-flow step 5)."""
     home = os.path.join(run_dir, "home")
     os.makedirs(os.path.join(home, ".cargo"), exist_ok=True)
     os.makedirs(os.path.join(home, ".m2"), exist_ok=True)
-    with open(os.path.join(home, ".cargo", "config.toml"), "w") as f:
-        f.write('[source.crates-io]\nreplace-with = "offload"\n\n'
-                f'[source.offload]\nregistry = "sparse+{proxy_url}/r/crates-index/"\n')
-    with open(os.path.join(home, ".m2", "settings.xml"), "w") as f:
-        f.write('<settings>\n  <mirrors>\n    <mirror>\n      <id>offload</id>\n      <mirrorOf>*</mirrorOf>\n'
-                f'      <url>{proxy_url}/r/maven/</url>\n    </mirror>\n  </mirrors>\n</settings>\n')
+    if "crates" in registries:
+        with open(os.path.join(home, ".cargo", "config.toml"), "w") as f:
+            f.write('[source.crates-io]\nreplace-with = "offload"\n\n'
+                    f'[source.offload]\nregistry = "sparse+{proxy_url}/r/crates-index/"\n')
+    if "maven" in registries:
+        with open(os.path.join(home, ".m2", "settings.xml"), "w") as f:
+            f.write('<settings>\n  <mirrors>\n    <mirror>\n      <id>offload</id>\n      <mirrorOf>*</mirrorOf>\n'
+                    f'      <url>{proxy_url}/r/maven/</url>\n    </mirror>\n  </mirrors>\n</settings>\n')
 
 
-WORKER_ENV_KEYS = frozenset(build_worker_env("/x", "m", "http://localhost:11434").keys())
+WORKER_ENV_KEYS = frozenset(build_worker_env("/x", "m", "http://localhost:11434", registries=tuple(REGISTRY_GROUPS)).keys())
 
 
 def check_init(event, allowed_tools=ALLOWED_TOOLS):
@@ -584,12 +632,13 @@ class EgressProxy:
 
     def __init__(self, upstream_url, reject_log, max_body=PROXY_MAX_BODY, routes=None, connector=None,
                  max_conns=PROXY_MAX_CONNS, max_upstream=PROXY_MAX_UPSTREAM, header_deadline=PROXY_HEADER_DEADLINE,
-                 run_budget=PROXY_RUN_BUDGET, rewrite_cap=PROXY_REWRITE_CAP, upstream_wait=30, request_log=None):
+                 run_budget=PROXY_RUN_BUDGET, rewrite_cap=PROXY_REWRITE_CAP, upstream_wait=30, request_log=None, registries=()):
         up = urlsplit(upstream_url)
         self.scheme, self.host = up.scheme, up.hostname
         self.port = up.port or (443 if up.scheme == "https" else 80)
         self.reject_log, self.max_body = reject_log, max_body
-        self.routes = dict(REGISTRY_ROUTES if routes is None else routes)
+        self.routes = dict({p: REGISTRY_ROUTES[p] for n in registries for p in REGISTRY_GROUPS[n]}
+                           if routes is None else routes)
         self.connector = connector or (lambda host, port, scheme: connect_registry(host, port))
         self.max_conns, self.header_deadline = max_conns, header_deadline
         self.run_budget, self.rewrite_cap, self.upstream_wait = run_budget, rewrite_cap, upstream_wait
@@ -614,11 +663,11 @@ class EgressProxy:
             with open(self.reject_log, "a") as f:
                 f.write(line)
 
-    def log_request(self, method, path, status, nbytes, rest):
+    def log_request(self, method, path, status, nbytes, prefix, rest):
         """One line per /r/ request in registry_requests.log, plus the count and distinct first segments."""
         line = "%s %s %s %s %d\n" % (time.strftime("%Y-%m-%dT%H:%M:%S%z"), method[:16],
                                      path[:512].encode("unicode_escape").decode("ascii"), status, nbytes)
-        seg = rest.split("/", 1)[0][:100].encode("unicode_escape").decode("ascii") if rest else ""
+        seg = registry_package(prefix, rest)[:100].encode("unicode_escape").decode("ascii")
         with self._lock:
             self.requests += 1
             if seg and seg not in self.packages and len(self.packages) < 50:
@@ -853,7 +902,7 @@ class EgressProxy:
                     finally:
                         proxy._slots.release()
                 finally:
-                    proxy.log_request(self.command, self.path, self._code, self._sent, route[2])
+                    proxy.log_request(self.command, self.path, self._code, self._sent, route[0], route[2])
 
             do_HEAD = do_GET
 
@@ -1087,7 +1136,7 @@ def write_profile(ctx, proxy_port=None, src_dir=None, path=None):
 
 
 def prepare_run(repo, slug, ohome, model=DEFAULT_MODEL, base=None, claude=None, allow_read=(),
-                max_thinking=DEFAULT_MAX_THINKING, max_turns=DEFAULT_MAX_TURNS):
+                max_thinking=DEFAULT_MAX_THINKING, max_turns=DEFAULT_MAX_TURNS, registries=()):
     """Run-flow steps 1 (partly), 2, 3 and the profile of step 4. Returns the run context.
 
     The profile written here has no network allow; cmd_run rewrites it once the proxy port is known."""
@@ -1112,6 +1161,7 @@ def prepare_run(repo, slug, ohome, model=DEFAULT_MODEL, base=None, claude=None, 
     ghome = os.path.join(run_dir, "home")
     ctx = {"run_id": run_id, "run_dir": run_dir, "repo": root, "slug": slug, "model": model, "base": base,
            "claude": claude, "allow_read": allow, "max_thinking": max_thinking, "max_turns": max_turns,
+           "registries": list(registries),
            "git_dir": os.path.join(run_dir, "git"), "src": os.path.join(run_dir, "src"),
            "profile": os.path.join(run_dir, "profile.sb"), "ghome": ghome, "proxy_port": None,
            "warnings": warnings}
@@ -1133,7 +1183,8 @@ def prepare_run(repo, slug, ohome, model=DEFAULT_MODEL, base=None, claude=None, 
     ctx["record"] = {"run_id": run_id, "run_dir": run_dir, "repo": root, "slug": slug, "model": model,
                      "branch": f"offload/{slug}", "base_sha": ctx["base_sha"], "base_url": base["url"],
                      "status": "prepared", "created": time.time(), "max_turns": max_turns,
-                     "claude": claude, "allow_read": allow, "warnings": warnings}
+                     "claude": claude, "allow_read": allow, "warnings": warnings,
+                     "registries": list(registries)}
     write_run_json(run_dir, ctx["record"])
     return ctx
 
@@ -1193,7 +1244,7 @@ def run_selftest(ctx, online=None):
     `online` says whether to run the probe that fetches a real registry page; None means run it only when
     pypi.org resolves from here (it is skipped when offline)."""
     env = build_worker_env(ctx["run_dir"], ctx["model"], worker_url(ctx), ctx["max_thinking"],
-                           allow_read=ctx.get("allow_read", ()))
+                           allow_read=ctx.get("allow_read", ()), registries=ctx.get("registries", ()))
     hm = real_home()
     results = []
     curl = "/usr/bin/curl"
@@ -1261,20 +1312,23 @@ def run_selftest(ctx, online=None):
             code_of("proxy answers 403 for PUT /r/npm/x", ["-X", "PUT", f"{base}/r/npm/x"])
             code_of("proxy answers 403 for GET /r/pypi/../../x", ["--path-as-is", f"{base}/r/pypi/../../x"])
             code_of("proxy answers 403 for GET /r/nope/", [f"{base}/r/nope/"])
-            if online is None:
-                try:
-                    socket.getaddrinfo("pypi.org", 443)
-                    online = True
-                except OSError:
-                    online = False
-            if online:
-                q = sb([curl, "-s", "-m", "20", "-w", "\n%{http_code}", f"{base}/r/pypi/simple/pip/"], timeout=30)
-                body, _, code = q.stdout.rpartition("\n")
-                record("proxy serves /r/pypi/simple/pip/ with rewritten links",
-                       code.strip() == "200" and "files.pythonhosted.org" not in body and "/r/pyfiles/" in body,
-                       f"http {code.strip()!r} exit {q.returncode}")
+            if "pypi" not in ctx.get("registries", ()):
+                code_of("proxy answers 403 for GET /r/pypi/simple/pip/ (pypi not enabled)", [f"{base}/r/pypi/simple/pip/"])
             else:
-                record("proxy serves /r/pypi/simple/pip/ (offline, skipped)", True)
+                if online is None:
+                    try:
+                        socket.getaddrinfo("pypi.org", 443)
+                        online = True
+                    except OSError:
+                        online = False
+                if online:
+                    q = sb([curl, "-s", "-m", "20", "-w", "\n%{http_code}", f"{base}/r/pypi/simple/pip/"], timeout=30)
+                    body, _, code = q.stdout.rpartition("\n")
+                    record("proxy serves /r/pypi/simple/pip/ with rewritten links",
+                           code.strip() == "200" and "files.pythonhosted.org" not in body and "/r/pyfiles/" in body,
+                           f"http {code.strip()!r} exit {q.returncode}")
+                else:
+                    record("proxy serves /r/pypi/simple/pip/ (offline, skipped)", True)
             record("the 33rd concurrent proxy connection is closed", *_probe_conn_limit(port))
     if os.path.exists("/usr/bin/pbpaste"):
         p = sb(["/usr/bin/pbpaste"], binary=True)  # never printed or stored: only the byte count
@@ -1438,7 +1492,7 @@ WORKER_PREAMBLE = ("You are working in a copy of the repo, in the current direct
 def launch_worker(ctx, brief_text, timeout_s):
     """Step 5/6: run the worker, reading stream-json incrementally. Returns an outcome dict."""
     env = build_worker_env(ctx["run_dir"], ctx["model"], worker_url(ctx), ctx["max_thinking"],
-                           allow_read=ctx.get("allow_read", ()))
+                           allow_read=ctx.get("allow_read", ()), registries=ctx.get("registries", ()))
     argv = sandbox_argv(ctx["profile"], build_claude_argv(ctx["claude"]["real"], ctx["max_turns"]))
     preamble = WORKER_PREAMBLE
     log_path = os.path.join(ctx["run_dir"], "worker.jsonl")
@@ -1559,7 +1613,7 @@ def load_run(ohome, run_id):
 def ctx_from_record(rec):
     rd = rec["run_dir"]
     return {"run_id": rec["run_id"], "run_dir": rd, "repo": rec["repo"], "slug": rec["slug"], "model": rec["model"],
-            "claude": rec.get("claude"), "allow_read": rec.get("allow_read") or [], "proxy_port": None,
+            "claude": rec.get("claude"), "allow_read": rec.get("allow_read") or [], "registries": rec.get("registries") or [], "proxy_port": None,
             "git_dir": os.path.join(rd, "git"), "src": os.path.join(rd, "src"),
             "profile": os.path.join(rd, "profile.sb"), "ghome": os.path.join(rd, "home"),
             "max_thinking": DEFAULT_MAX_THINKING}
@@ -1602,10 +1656,11 @@ def cmd_run(args, ohome):
     with open(args.brief, encoding="utf-8") as f:
         brief = f.read()
     slug = validate_slug(args.slug or default_slug(args.brief))
+    registries = parse_registries(args.registries)
     claude = resolve_claude(args.allow_untested_claude)
     base = resolve_base_url(args.base_url)
     ctx = prepare_run(args.repo, slug, ohome, args.model, base, claude, args.allow_read,
-                      args.max_thinking_tokens, args.max_turns)
+                      args.max_thinking_tokens, args.max_turns, registries)
     rec = ctx["record"]
 
     def finish(status, extra=None):
@@ -1620,15 +1675,16 @@ def cmd_run(args, ohome):
            "usage": {"input": 0, "cache_read": 0, "output": 0}, "est_cost_usd": None, "untrusted_diffstat": "",
            "untrusted_sensitive_paths": [], "untrusted_worker_text": "", "format_chars": 0,
            "survivors_killed": [], "log_path": os.path.join(ctx["run_dir"], "worker.jsonl"),
-           "warnings": ctx["warnings"]}
+           "warnings": ctx["warnings"], "registries": registries}
     head = None
     try:
         init_worker_git(ctx)
-        proxy = EgressProxy(base["url"], os.path.join(ctx["run_dir"], "proxy_rejects.log"))
+        proxy = EgressProxy(base["url"], os.path.join(ctx["run_dir"], "proxy_rejects.log"),
+                           registries=ctx["registries"])
         try:
             ctx["proxy_port"] = proxy.start()
             write_profile(ctx, ctx["proxy_port"])
-            write_registry_configs(ctx["run_dir"], worker_url(ctx))
+            write_registry_configs(ctx["run_dir"], worker_url(ctx), ctx["registries"])
             ok, checks = run_selftest(ctx)
             if not ok:
                 out.update(status="sandbox_selftest_failed", selftest=checks)
@@ -1739,7 +1795,8 @@ def cmd_test(args, ohome):
         if not ok:
             emit({"status": "sandbox_selftest_failed", "selftest": checks})
             return 1
-        env = build_worker_env(ctx["run_dir"], ctx["model"], worker_url(tctx), allow_read=ctx["allow_read"])
+        env = build_worker_env(ctx["run_dir"], ctx["model"], worker_url(tctx), allow_read=ctx["allow_read"],
+                               registries=ctx.get("registries", ()))
         proc = subprocess.Popen(sandbox_argv(tprofile, cmd), cwd=testsrc, env=env, shell=False,
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 start_new_session=True)
@@ -1852,6 +1909,7 @@ def build_parser():
     r.add_argument("--max-thinking-tokens", type=int, default=DEFAULT_MAX_THINKING)
     r.add_argument("--allow-read", action="append", default=[])
     r.add_argument("--base-url")
+    r.add_argument("--registries", default="", metavar="LIST")
     r.add_argument("--allow-untested-claude", action="store_true")
     t = sub.add_parser("test")
     t.add_argument("--run", required=True)

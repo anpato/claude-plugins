@@ -175,8 +175,7 @@ def test_worker_env_exact_keys_and_no_inherited_token(monkeypatch):
         "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL",
         "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
         "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "MAX_THINKING_TOKENS",
-        "PIP_INDEX_URL", "PIP_TRUSTED_HOST", "NPM_CONFIG_REGISTRY", "CARGO_HOME", "GOPROXY", "GOFLAGS",
-        "GOSUMDB", "GOCACHE"}
+        "CARGO_HOME", "GOPROXY", "GOFLAGS", "GOSUMDB", "GOCACHE"}
     assert "ANTHROPIC_AUTH_TOKEN" not in env
     assert env["ANTHROPIC_BASE_URL"] == "http://localhost:11434"
     assert env["HOME"] == "/r/home" and env["TMPDIR"] == "/r/tmp" == env["CLAUDE_CODE_TMPDIR"]
@@ -613,8 +612,12 @@ def test_integration_selftest_passes_and_isolation(tmp_path, repo):
         names = " | ".join(r["check"] for r in results)
         for needle in ("proxy answers 403", "direct connect to localhost:11434", "pbpaste", "DNS lookup",
                        "CONNECT pypi.org:443", "absolute-form GET", "PUT /r/npm/x", "/r/pypi/../../x",
-                       "/r/nope/", "(offline, skipped)", "33rd concurrent"):
+                       "/r/nope/", "(pypi not enabled)", "33rd concurrent"):
             assert needle in names, names
+        ctx["registries"] = ["pypi"]
+        ok, results = offload.run_selftest(ctx, online=False)
+        names = " | ".join(r["check"] for r in results)
+        assert ok and "(offline, skipped)" in names and "not enabled" not in names and "/r/nope/" in names
         assert up.seen == []
         assert "/api/pull" in (Path(ctx["run_dir"]) / "proxy_rejects.log").read_text()
     finally:
@@ -990,7 +993,7 @@ def test_clt_constant_is_hardcoded():
 
 
 def test_registry_env_points_at_proxy():
-    env = offload.build_worker_env("/r", "m", "http://127.0.0.1:5555")
+    env = offload.build_worker_env("/r", "m", "http://127.0.0.1:5555", registries=("pypi", "npm"))
     assert env["PIP_INDEX_URL"] == "http://127.0.0.1:5555/r/pypi/simple" and env["PIP_TRUSTED_HOST"] == "127.0.0.1"
     assert env["NPM_CONFIG_REGISTRY"] == "http://127.0.0.1:5555/r/npm/"
     assert env["CARGO_HOME"] == "/r/home/.cargo"
@@ -1009,7 +1012,7 @@ def test_gomodcache_only_when_allowed(tmp_path):
 
 
 def test_write_registry_configs(tmp_path):
-    offload.write_registry_configs(str(tmp_path), "http://127.0.0.1:5555")
+    offload.write_registry_configs(str(tmp_path), "http://127.0.0.1:5555", ("crates", "maven"))
     cargo = (tmp_path / "home" / ".cargo" / "config.toml").read_text()
     assert 'replace-with = "offload"' in cargo and 'registry = "sparse+http://127.0.0.1:5555/r/crates-index/"' in cargo
     mvn = (tmp_path / "home" / ".m2" / "settings.xml").read_text()
@@ -1195,6 +1198,14 @@ def reg_proxy(tmp_path):
     for px in made:
         px.stop()
     reg.close()
+
+
+def wait_logged(px, n):
+    """The handler logs after the response is sent, so the client can be ahead of the log."""
+    for _ in range(200):
+        if px.registry_summary()["count"] >= n:
+            return
+        time.sleep(0.01)
 
 
 def get(port, path, method="GET", headers=None, body=None):
@@ -1435,8 +1446,10 @@ def test_integration_cmd_run_inits_worker_git_writes_configs_and_reports_warning
         return {"init_problems": [], "saw_init": True, "timed_out": False, "result": {"is_error": False}, "usage": {},
                 "text": "", "returncode": 0, "turns": 1, "survivors_killed": []}
     monkeypatch.setattr(offload, "launch_worker", fake_launch)
-    assert offload.main(["--home", ohome, "run", "--repo", str(repo), "--brief", str(brief), "--slug", "job"]) == 0
+    assert offload.main(["--home", ohome, "run", "--repo", str(repo), "--brief", str(brief), "--slug", "job",
+                         "--registries", "maven,crates"]) == 0
     out = json.loads(capsys.readouterr().out)
+    assert out["registries"] == ["crates", "maven"]
     assert out["warnings"] == ["default root skipped"] and out["status"] == "ok"
     assert seen["log"] == "base"
     assert f"sparse+http://127.0.0.1:{seen['port']}/r/crates-index/" in seen["cargo"]
@@ -1573,15 +1586,16 @@ def test_registry_request_log_and_summary(reg_proxy):
     get(port, "/r/npm/left-pad/-/left-pad-1.tgz")
     get(port, "/r/npm/other")
     get(port, "/r/pypi/simple/pip/")
+    wait_logged(px, 4)
     assert px.request_log == str(log.parent / "registry_requests.log")
     lines = Path(px.request_log).read_text().splitlines()
     assert len(lines) == 4
     assert "GET /r/npm/left-pad 200 2" in lines[0] and " 404 " in lines[1]
-    assert px.registry_summary() == {"count": 4, "packages": ["left-pad", "other", "simple"]}
+    assert px.registry_summary() == {"count": 4, "packages": ["left-pad", "other", "pip"]}
     for i in range(60):
-        px.log_request("GET", f"/r/npm/p{i}", 200, 0, f"p{i}")
+        px.log_request("GET", f"/r/npm/p{i}", 200, 0, "/r/npm/", f"p{i}")
     assert len(px.registry_summary()["packages"]) == 50 and px.registry_summary()["count"] == 64
-    px.log_request("GET", "/r/npm/a\x1b[31mb", 200, 0, "a\x1b[31mb")
+    px.log_request("GET", "/r/npm/a\x1b[31mb", 200, 0, "/r/npm/", "a\x1b[31mb")
     assert "\x1b" not in Path(px.request_log).read_text()
 
 
@@ -1600,3 +1614,121 @@ def test_cmd_run_reports_registry_requests(tmp_path, repo, monkeypatch, capsys):
     assert out["registry_requests"] == {"count": 0, "packages": []}
     rec = json.loads((Path(ohome) / "runs" / out["run_id"] / "run.json").read_text())
     assert rec["registry_requests"] == {"count": 0, "packages": []}
+
+
+# ------------------------------------------------------------------ registries are off by default (user decision 2026-10-27)
+
+def test_parse_registries():
+    assert offload.parse_registries("") == [] and offload.parse_registries(None) == []
+    assert offload.parse_registries("maven, pypi,pypi") == ["pypi", "maven"]
+    for bad in ("pip", "pypi,go", ","):
+        with pytest.raises(offload.OffloadError):
+            offload.parse_registries(bad)
+
+
+def test_registry_groups_map_to_routes():
+    assert offload.REGISTRY_GROUPS["pypi"] == ("/r/pypi/", "/r/pyfiles/")
+    assert offload.REGISTRY_GROUPS["crates"] == ("/r/crates-index/", "/r/crates-static/")
+    assert {p for g in offload.REGISTRY_GROUPS.values() for p in g} == set(offload.REGISTRY_ROUTES)
+
+
+def test_proxy_serves_no_registry_route_by_default(tmp_path):
+    px = offload.EgressProxy("http://127.0.0.1:9", str(tmp_path / "rej.log"))
+    try:
+        port = px.start()
+        assert get(port, "/r/pypi/simple/pip/")[0].status == 403
+        assert get(port, "/r/maven/a/b")[0].status == 403
+        assert "/r/pypi/simple/pip/" in (tmp_path / "rej.log").read_text()
+        assert px.routes == {}
+    finally:
+        px.stop()
+
+
+def test_proxy_enables_only_named_registry_groups(tmp_path):
+    px = offload.EgressProxy("http://127.0.0.1:9", str(tmp_path / "rej.log"), registries=["pypi", "crates"])
+    try:
+        assert set(px.routes) == {"/r/pypi/", "/r/pyfiles/", "/r/crates-index/", "/r/crates-static/"}
+        port = px.start()
+        assert get(port, "/r/npm/left-pad")[0].status == 403
+    finally:
+        px.stop()
+
+
+def test_worker_env_and_configs_only_for_enabled_registries(tmp_path):
+    none = offload.build_worker_env("/r", "m", "http://127.0.0.1:5")
+    assert not {"PIP_INDEX_URL", "PIP_TRUSTED_HOST", "NPM_CONFIG_REGISTRY"} & set(none)
+    pip = offload.build_worker_env("/r", "m", "http://127.0.0.1:5", registries=["pypi"])
+    assert "PIP_INDEX_URL" in pip and "NPM_CONFIG_REGISTRY" not in pip
+    npm = offload.build_worker_env("/r", "m", "http://127.0.0.1:5", registries=["npm"])
+    assert "NPM_CONFIG_REGISTRY" in npm and "PIP_INDEX_URL" not in npm
+    assert set(none) | {"PIP_INDEX_URL", "PIP_TRUSTED_HOST", "NPM_CONFIG_REGISTRY"} == offload.WORKER_ENV_KEYS
+    offload.write_registry_configs(str(tmp_path), "http://127.0.0.1:5")
+    assert not (tmp_path / "home" / ".cargo" / "config.toml").exists()
+    assert not (tmp_path / "home" / ".m2" / "settings.xml").exists()
+    offload.write_registry_configs(str(tmp_path), "http://127.0.0.1:5", ["maven"])
+    assert (tmp_path / "home" / ".m2" / "settings.xml").exists()
+    assert not (tmp_path / "home" / ".cargo" / "config.toml").exists()
+
+
+@needs_sandbox
+def test_cmd_run_registries_flag_recorded_and_unknown_rejected(tmp_path, repo, monkeypatch, capsys):
+    ohome = os.path.realpath(tmp_path / "ohome")
+    brief = tmp_path / "brief.md"
+    brief.write_text("do it\n")
+    monkeypatch.setattr(offload, "resolve_claude", lambda allow=False: fake_claude())
+    monkeypatch.setattr(offload, "run_selftest", lambda c: (True, []))
+    seen = {}
+
+    def fake_launch(ctx, *a, **k):
+        seen["routes"] = sorted(os.listdir(Path(ctx["run_dir"]) / "home"))
+        seen["m2"] = (Path(ctx["run_dir"]) / "home" / ".m2" / "settings.xml").exists()
+        seen["cargo"] = (Path(ctx["run_dir"]) / "home" / ".cargo" / "config.toml").exists()
+        return {"init_problems": [], "saw_init": True, "timed_out": False, "result": {"is_error": False}, "usage": {},
+                "text": "", "returncode": 0, "turns": 1, "survivors_killed": []}
+    monkeypatch.setattr(offload, "launch_worker", fake_launch)
+    base = ["--home", ohome, "run", "--repo", str(repo), "--brief", str(brief)]
+    assert offload.main(base + ["--slug", "off"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["registries"] == [] and seen["m2"] is False and seen["cargo"] is False
+    rec = json.loads((Path(ohome) / "runs" / out["run_id"] / "run.json").read_text())
+    assert rec["registries"] == []
+    assert offload.main(base + ["--slug", "on", "--registries", "maven"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["registries"] == ["maven"] and seen["m2"] is True and seen["cargo"] is False
+    rec = json.loads((Path(ohome) / "runs" / out["run_id"] / "run.json").read_text())
+    assert rec["registries"] == ["maven"]
+    runs_before = sorted(os.listdir(Path(ohome) / "runs"))
+    assert offload.main(base + ["--slug", "bad", "--registries", "pypi,nope"]) != 0
+    assert sorted(os.listdir(Path(ohome) / "runs")) == runs_before  # nothing prepared, nothing spent
+
+
+@pytest.mark.parametrize("prefix,rest,name", [
+    ("/r/pypi/", "simple/requests/", "requests"),
+    ("/r/pypi/", "simple/requests", "requests"),
+    ("/r/pypi/", "requests/json", "requests"),
+    ("/r/pypi/", "simple/", ""),
+    ("/r/pyfiles/", "packages/ab/cd/ef0123/requests-2.31.0.tar.gz", "requests"),
+    ("/r/pyfiles/", "packages/ab/cd/ef0123/my_pkg-1.0-py3-none-any.whl", "my_pkg"),
+    ("/r/pyfiles/", "packages/ab/cd/ef/weird.whl", "weird.whl"),
+    ("/r/npm/", "left-pad", "left-pad"),
+    ("/r/npm/", "left-pad/-/left-pad-1.0.0.tgz", "left-pad"),
+    ("/r/npm/", "@types/node", "@types/node"),
+    ("/r/npm/", "@types/node/-/node-1.tgz", "@types/node"),
+    ("/r/crates-static/", "crates/serde/serde-1.0.0.crate", "serde"),
+    ("/r/crates-index/", "se/rd/serde", "serde"),
+    ("/r/crates-index/", "config.json", ""),
+    ("/r/maven/", "org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar", "org/apache/commons/commons-lang3"),
+    ("/r/maven/", "org/apache/commons/commons-lang3/maven-metadata.xml", "org/apache/commons/commons-lang3"),
+    ("/r/maven/", "org/apache/commons/commons-lang3/3.12.0/", "org/apache/commons/commons-lang3"),
+])
+def test_registry_package_names_per_route(prefix, rest, name):
+    assert offload.registry_package(prefix, rest) == name
+
+
+def test_registry_summary_holds_real_package_names(reg_proxy):
+    reg, make, _ = reg_proxy
+    px, port = make()
+    for path in ("/r/pypi/simple/requests/", "/r/npm/@types/node", "/r/crates-static/crates/serde/serde-1.0.crate"):
+        get(port, path)
+    wait_logged(px, 3)
+    assert px.registry_summary()["packages"] == ["requests", "@types/node", "serde"]
