@@ -166,6 +166,7 @@ const offloadRow = (raw: unknown, now: number): SquadAgent | undefined => {
     title: asText(r.slug) ?? runId,
     type: 'offload',
     model: asText(r.model) ?? '',
+    toolCalls: typeof r.tool_calls === 'number' ? r.tool_calls : undefined,
     usage: ZERO,
     contextTokens: 0,
   }
@@ -498,7 +499,7 @@ export const register: Register = (on, options) => {
               {title}
               <Text>
                 {isIdle(a, now, stallMs) && <Text dimColor color={STALL_COLOR}>{idleLabel(a, now)} </Text>}
-                <Text dimColor>{[stepsLabel(a), callsLabel(a)].filter(Boolean).join(' · ')} </Text>
+                <Text dimColor>{[modelLabel(a.model), stepsLabel(a), callsLabel(a)].filter(Boolean).join(' · ')} </Text>
                 {mark}
               </Text>
             </Box>

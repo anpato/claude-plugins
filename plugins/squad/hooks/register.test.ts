@@ -178,10 +178,11 @@ test('more agents than the pane holds collapse to title and bar', async ($, on) 
   for (let i = 0; i < 6; i++) await $.agent.spawn({ ...spawnInput, tool_use_id: `tc${i}`, description: `Task ${i}` } as never)
 
   // Six full rows need 32 lines; a 12-line pane gets the compact layout, which
-  // drops the model line, while a 60-line pane keeps every row in full.
+  // drops the vehicles but keeps the model beside the calls, while a 60-line
+  // pane keeps every row in full.
   const small = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', component: 'Pane', requestId: 'squad', props: { ...pane, scroll: { offset: 0, bodyRows: 12 } } })
   expect(await small.find({ text: /Task 5/ })).toBeDefined()
-  expect(await small.find({ text: /Sonnet 5\.5/ })).toBeUndefined()
+  expect(await small.find({ text: /Sonnet 5\.5 · … · 0 calls/ })).toBeDefined()
   expect((await small.findAll({ type: 'Raster' })).length).toBe(0)
   await small.unmount()
 
@@ -292,7 +293,7 @@ test('offload runs show as rows, and bad files are skipped', async ($, on) => {
   const dir = '/home/u/.cache/offload/runs'
   const nowS = 10_000
   const files: Record<string, string> = {
-    r1: runJson({ run_id: 'r1', slug: 'build-index', model: 'claude-haiku-5-5', status: 'running', created: nowS - 90 }),
+    r1: runJson({ run_id: 'r1', slug: 'build-index', model: 'claude-haiku-5-5', status: 'running', created: nowS - 90, tool_calls: 7 }),
     r2: runJson({ run_id: 'r2', slug: 'fresh-done', model: 'claude-sonnet-5-5', status: 'ok', created: nowS - 400, duration_s: 100 }),
     r3: runJson({ run_id: 'r3', slug: 'bad-run', status: 'timeout', created: nowS - 400, ended_at: nowS - 300 }),
     r4: runJson({ run_id: 'r4', slug: 'ancient', status: 'ok', created: nowS - 9000, ended_at: nowS - 8000 }),
@@ -313,6 +314,7 @@ test('offload runs show as rows, and bad files are skipped', async ($, on) => {
   expect(await ui.find({ text: /build-index/ })).toBeDefined()
   expect(await ui.find({ text: /prepared-one/ })).toBeDefined()
   expect(await ui.find({ text: /Haiku 5\.5/ })).toBeDefined()
+  expect(await ui.find({ text: /7 calls/ })).toBeDefined()
   expect(await ui.find({ text: /fresh-done/ })).toBeDefined()
   expect(await ui.find({ text: /bad-run/ })).toBeDefined()
   expect(await ui.find({ text: /ancient/ })).toBeUndefined()
@@ -363,4 +365,22 @@ test('no offload directory means no reads', async ($, on) => {
   await startSession($)
   await clock.advance(12_000)
   expect(listed).toBe(0)
+})
+
+test('compact rows still name the model, and Kimi reads as Kimi K3', async ($, on) => {
+  const clock = mock.clock(on, { now: 10_000_000 })
+  mock.env(on, { HOME: '/home/u' })
+  sessionStub(on)
+  const dir = '/home/u/.cache/offload/runs'
+  const run = runJson({ run_id: 'k1', slug: 'recall-usage', model: 'kimi-k3:cloud', status: 'running', created: 9_990, tool_calls: 12 })
+  on('fs.exists', (_$, e) => ({ value: e.path === dir }))
+  on('fs.list', () => ({ value: [{ name: 'k1', kind: 'dir', size: 0, mtimeMs: 0, isLink: false }] }) as never)
+  on('fs.read', () => ({ value: run }) as never)
+  await startSession($)
+  await clock.advance(5_000)
+
+  const tight = { ...pane, scroll: { offset: 0, bodyRows: 3 } }
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', component: 'Pane', requestId: 'squad', props: tight })
+  expect(await ui.find({ text: /Kimi K3 · 12 calls/ })).toBeDefined()
+  await ui.unmount()
 })
