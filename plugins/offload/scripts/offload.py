@@ -20,6 +20,7 @@ Every subcommand prints JSON to stdout; `diff` prints the diff text and then a J
 import argparse
 import hashlib
 import http.client
+import ipaddress
 import json
 import os
 import pwd
@@ -29,6 +30,7 @@ import selectors
 import shutil
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import tarfile
@@ -36,16 +38,18 @@ import threading
 import time
 import unicodedata
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
+from urllib.parse import quote, unquote, urljoin, urlsplit
 
 TESTED_CLAUDE_VERSIONS = {"2.1.312"}
 DEFAULT_MODEL = "kimi-k3:cloud"
 DEFAULT_BASE_URL = "http://localhost:11434"
-DEFAULT_MAX_TURNS = 40
+DEFAULT_MAX_TURNS = 60
 DEFAULT_TIMEOUT_MIN = 45
 DEFAULT_MAX_THINKING = 8000
 UNTRUSTED_LIMIT = 4096
 SAFE_PATH = "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin"
+# First on the worker's PATH only (never the helper's): the real python3/git, not the xcrun shims.
+CLT_BIN = "/Library/Developer/CommandLineTools/usr/bin"
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$")
 RUN_ID_RE = re.compile(r"^[0-9a-f]{8}-[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$")
@@ -59,15 +63,80 @@ PRICES = {"kimi-k3:cloud": (3.0, 0.30, 15.0)}
 ALLOW_READ_HOME = ("go/pkg/mod", ".cargo/registry", ".cargo/git", ".rustup", ".m2/repository",
                    ".gradle/caches", ".npm/_cacache")
 ALLOW_READ_REPO = ("node_modules", "vendor", ".venv")
+# Readable on every run when present: toolchains only. ~/.cargo/registry can hold private registries.
+DEFAULT_READ_HOME = (".rustup",)
 PROXY_ALLOWED_PATHS = ("/v1/messages", "/v1/messages/count_tokens")
 PROXY_MAX_BODY = 32 * 1024 * 1024
 PROXY_UPSTREAM_TIMEOUT = 900
+# Registry routes of the egress proxy: GET/HEAD only, each prefix to one constant upstream.
+REGISTRY_ROUTES = {
+    "/r/pypi/": "https://pypi.org/",
+    "/r/pyfiles/": "https://files.pythonhosted.org/",
+    "/r/npm/": "https://registry.npmjs.org/",
+    "/r/crates-index/": "https://index.crates.io/",
+    "/r/crates-static/": "https://static.crates.io/",
+    "/r/maven/": "https://repo.maven.apache.org/maven2/",
+}
+# `run --registries` names -> routes served (user decision 2026-10-27: off by default, enabled per run)
+REGISTRY_GROUPS = {
+    "pypi": ("/r/pypi/", "/r/pyfiles/"),
+    "npm": ("/r/npm/",),
+    "crates": ("/r/crates-index/", "/r/crates-static/"),
+    "maven": ("/r/maven/",),
+}
+
+
+def parse_registries(value):
+    """'pypi,npm' -> ['npm', 'pypi'] (canonical order); an unknown name is an error before any spend."""
+    names = [n.strip() for n in (value or "").split(",") if n.strip()]
+    bad = [n for n in names if n not in REGISTRY_GROUPS]
+    if bad or (value and not names):
+        raise OffloadError(f"unknown registry {bad or value!r}; choose from {', '.join(REGISTRY_GROUPS)}")
+    return [n for n in REGISTRY_GROUPS if n in names]
+
+
+def registry_package(prefix, rest):
+    """The package a /r/ request is for, taken from the decoded path after the route prefix ('' if none)."""
+    parts = [s for s in rest.split("/") if s]
+    if not parts:
+        return ""
+    if prefix == "/r/pypi/":
+        name = parts[1] if parts[0] == "simple" and len(parts) > 1 else (parts[0] if parts[0] != "simple" else "")
+    elif prefix == "/r/pyfiles/":
+        m = re.match(r"(.+?)-\d", parts[-1])
+        name = m.group(1) if m else parts[-1]
+    elif prefix == "/r/npm/":
+        name = "/".join(parts[:2]) if parts[0].startswith("@") and len(parts) > 1 else parts[0]
+    elif prefix == "/r/crates-static/":
+        name = parts[1] if parts[0] == "crates" and len(parts) > 1 else ""
+    elif prefix == "/r/crates-index/":
+        name = "" if rest == "config.json" else parts[-1]
+    elif prefix == "/r/maven/":
+        if "." in parts[-1]:
+            parts = parts[:-1]
+        if len(parts) > 1 and re.match(r"\d", parts[-1]):
+            parts = parts[:-1]
+        name = "/".join(parts)
+    else:
+        name = parts[0]
+    return name
+PROXY_MAX_CONNS = 32
+PROXY_MAX_UPSTREAM = 8
+PROXY_CLIENT_TIMEOUT = 30
+PROXY_HEADER_DEADLINE = 60
+PROXY_RUN_BUDGET = 4 * 1024 ** 3
+PROXY_REWRITE_CAP = 64 * 1024 * 1024
 OUTPUT_RING = 64 * 1024
-SENSITIVE_DIRS = {".claude", ".github", ".husky", ".githooks", ".vscode", ".idea"}
+SENSITIVE_DIRS = {".claude", ".github", ".husky", ".githooks", ".vscode", ".idea", ".cargo", ".mvn"}
 SENSITIVE_BASENAMES = {"Makefile", "package.json", "conftest.py", "setup.py", "build.rs", ".envrc",
                        ".pre-commit-config.yaml", "pyproject.toml", "setup.cfg", "sitecustomize.py",
-                       "usercustomize.py", "Justfile", "Rakefile", "Dockerfile", ".npmrc"}
-SENSITIVE_PREFIXES = ("lefthook", "docker-compose", ".yarnrc")
+                       "usercustomize.py", "Justfile", "Rakefile", "Dockerfile", ".npmrc",
+                       "requirements.txt", "Cargo.toml", "go.mod", "pom.xml", "build.gradle", "build.gradle.kts",
+                       "settings.gradle", "settings.gradle.kts", ".pypirc",
+                       "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "Cargo.lock",
+                       "go.sum", "poetry.lock", "uv.lock", "Pipfile", "Pipfile.lock", ".pnpmfile.cjs",
+                       "gradle-wrapper.properties"}
+SENSITIVE_PREFIXES = ("lefthook", "docker-compose", ".yarnrc", "requirements")
 ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[@-Z\\-_])")
 
 
@@ -269,14 +338,43 @@ def build_claude_argv(claude_real, max_turns):
             "--disallowedTools", ",".join(DENIED_TOOLS), "--disable-slash-commands"]
 
 
-def build_worker_env(run_dir, model, base_url, max_thinking=DEFAULT_MAX_THINKING, lang=None):
-    """Exactly the spec's key set. Nothing is inherited from os.environ except an optional LANG."""
+def clt_bin_dir():
+    """The Command Line Tools bin dir if it exists and is root-owned, else None. Hard-coded on purpose:
+    never taken from `xcode-select -p`, which the environment can influence."""
+    try:
+        st = os.stat(CLT_BIN)
+    except OSError:
+        return None
+    return CLT_BIN if st.st_uid == 0 and os.path.isdir(CLT_BIN) else None
+
+
+def worker_path(clt):
+    """User toolchains first (Homebrew: current python3 and git, no xcrun shim), then the CLT, then the system.
+    The helper's own git keeps SAFE_PATH."""
+    head = ["/opt/homebrew/bin", "/usr/local/bin"] + ([clt] if clt else [])
+    rest = [d for d in SAFE_PATH.split(":") if d not in head]
+    return ":".join(head + rest)
+
+
+def go_modcache(allow_read, home=None):
+    """The real ~/go/pkg/mod if --allow-read named it, else None."""
+    root = os.path.realpath(os.path.join(home or real_home(), "go", "pkg", "mod"))
+    return root if any(os.path.realpath(p) == root for p in allow_read) else None
+
+
+def build_worker_env(run_dir, model, base_url, max_thinking=DEFAULT_MAX_THINKING, lang=None, allow_read=(),
+                     registries=()):
+    """Exactly the spec's key set. Nothing is inherited from os.environ except an optional LANG.
+
+    base_url is the local proxy (P); the registry settings point at P/r/... and work only while it is up."""
     tmp = os.path.join(run_dir, "tmp")
+    clt = clt_bin_dir()
     env = {
-        "PATH": SAFE_PATH,
+        "PATH": worker_path(clt),
+        "PYTHONDONTWRITEBYTECODE": "1",
         "HOME": os.path.join(run_dir, "home"),
         "LANG": lang or os.environ.get("LANG") or "en_US.UTF-8",
-        "TMPDIR": tmp, "CLAUDE_CODE_TMPDIR": tmp, "TMPPREFIX": tmp,
+        "TMPDIR": tmp, "CLAUDE_CODE_TMPDIR": tmp, "TMPPREFIX": os.path.join(tmp, "zsh"),
         "CLAUDE_CONFIG_DIR": os.path.join(run_dir, "config"),
         "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
         "ANTHROPIC_BASE_URL": base_url, "ANTHROPIC_API_KEY": "ollama",
@@ -285,11 +383,36 @@ def build_worker_env(run_dir, model, base_url, max_thinking=DEFAULT_MAX_THINKING
         "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
         "MAX_THINKING_TOKENS": str(int(max_thinking)),
+        "CARGO_HOME": os.path.join(run_dir, "home", ".cargo"),
+        "GOPROXY": "off", "GOFLAGS": "-mod=mod", "GOSUMDB": "off", "GOCACHE": os.path.join(tmp, "gocache"),
     }
+    # package registries, through the proxy's read-only routes, only for the ones enabled for this run
+    if "pypi" in registries:
+        env.update(PIP_INDEX_URL=f"{base_url}/r/pypi/simple", PIP_TRUSTED_HOST="127.0.0.1")
+    if "npm" in registries:
+        env["NPM_CONFIG_REGISTRY"] = f"{base_url}/r/npm/"
+    mod = go_modcache(allow_read)
+    if mod:
+        env["GOMODCACHE"] = mod
     return env
 
 
-WORKER_ENV_KEYS = frozenset(build_worker_env("/x", "m", "http://localhost:11434").keys())
+def write_registry_configs(run_dir, proxy_url, registries=()):
+    """Helper-written cargo config and maven settings, both pointing at the proxy (run-flow step 5)."""
+    home = os.path.join(run_dir, "home")
+    os.makedirs(os.path.join(home, ".cargo"), exist_ok=True)
+    os.makedirs(os.path.join(home, ".m2"), exist_ok=True)
+    if "crates" in registries:
+        with open(os.path.join(home, ".cargo", "config.toml"), "w") as f:
+            f.write('[source.crates-io]\nreplace-with = "offload"\n\n'
+                    f'[source.offload]\nregistry = "sparse+{proxy_url}/r/crates-index/"\n')
+    if "maven" in registries:
+        with open(os.path.join(home, ".m2", "settings.xml"), "w") as f:
+            f.write('<settings>\n  <mirrors>\n    <mirror>\n      <id>offload</id>\n      <mirrorOf>*</mirrorOf>\n'
+                    f'      <url>{proxy_url}/r/maven/</url>\n    </mirror>\n  </mirrors>\n</settings>\n')
+
+
+WORKER_ENV_KEYS = frozenset(build_worker_env("/x", "m", "http://localhost:11434", registries=tuple(REGISTRY_GROUPS)).keys())
 
 
 def check_init(event, allowed_tools=ALLOWED_TOOLS):
@@ -357,6 +480,22 @@ def validate_allow_read(path, home=None, repo_root=None):
     raise OffloadError(f"--allow-read {path!r} (resolves to {real}) is not on the allowlist: {', '.join(names)}")
 
 
+def default_read_roots(home=None, repo_root=None):
+    """The DEFAULT_READ_HOME roots that exist and pass validate_allow_read, plus a warning for each that
+    exists but fails it (such as a symlink leaving $HOME). A failing default never fails the run."""
+    home = home or real_home()
+    roots, warnings = [], []
+    for rel in DEFAULT_READ_HOME:
+        path = os.path.join(home, rel)
+        if not os.path.lexists(path):
+            continue
+        try:
+            roots.append(validate_allow_read(path, home=home, repo_root=repo_root))
+        except OffloadError as e:
+            warnings.append(f"default read root ~/{rel} skipped: {e}")
+    return roots, warnings
+
+
 def generate_profile(run_dir, claude_real, claude_link=None, allow_read=(), repo_root=None,
                      home=None, temp_dir="auto", proxy_port=None, src_dir=None):
     """Build the SBPL text. Later rules win, so narrower allows follow the broad denies.
@@ -422,25 +561,108 @@ def generate_profile(run_dir, claude_real, claude_link=None, allow_read=(), repo
 
 # ------------------------------------------------------------------ egress proxy
 
+class UpstreamBlocked(OSError):
+    """An upstream connection the proxy refuses to make (a non-global address)."""
+
+
+# IPv6 forms that embed an IPv4 address (loopback, private) but that is_global can report as global.
+_EMBEDDED_V4 = [ipaddress.ip_network(n) for n in ("::/96", "::ffff:0:0/96", "64:ff9b::/96")]
+
+
+def _is_public_ip(addr):
+    ip = ipaddress.ip_address(addr.split("%")[0])
+    if ip.version == 6 and any(ip in n for n in _EMBEDDED_V4):
+        return False
+    return ip.is_global
+
+
+def connect_registry(host, port=443, resolver=socket.getaddrinfo, ssl_context=None, timeout=60):
+    """Open a verified TLS connection to a registry host. Every resolved address must be globally routable;
+    the connection goes to the vetted address (no second lookup) with SNI and certificate checks for `host`."""
+    infos = resolver(host, port, type=socket.SOCK_STREAM)
+    addrs = [i[4][0] for i in infos]
+    if not addrs or not all(_is_public_ip(a) for a in addrs):
+        raise UpstreamBlocked(f"{host} resolves to a non-global address")
+    ctx = ssl_context or ssl.create_default_context()
+
+    class Pinned(http.client.HTTPSConnection):
+        def connect(self):
+            last = None
+            for ip in addrs:  # only vetted addresses, in order; no second lookup
+                try:
+                    sock = socket.create_connection((ip, self.port), self.timeout)
+                    break
+                except OSError as e:
+                    last = e
+            else:
+                raise last
+            self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+    return Pinned(host, port, context=ctx, timeout=timeout)
+
+
+class _ProxyServer(ThreadingHTTPServer):
+    """Caps concurrent connections: extras are accepted and closed at once, with a log line."""
+    daemon_threads = True
+    request_queue_size = 64
+
+    def __init__(self, addr, handler, proxy):
+        self.proxy = proxy
+        self._counted = set()
+        super().__init__(addr, handler)
+
+    def verify_request(self, request, client_address):
+        with self.proxy._lock:
+            if len(self._counted) >= self.proxy.max_conns:
+                full = True
+            else:
+                full = False
+                self._counted.add(request)
+        if full:
+            self.proxy.log_reject("CONN", "connection limit reached")
+        return not full
+
+    def shutdown_request(self, request):
+        with self.proxy._lock:
+            self._counted.discard(request)
+        super().shutdown_request(request)
+
+
 class EgressProxy:
-    """A filtering forwarding proxy on 127.0.0.1, run in the helper for the life of the worker.
+    """A filtering proxy on 127.0.0.1, run in the helper for the life of the worker.
 
-    It forwards only POST /v1/messages and POST /v1/messages/count_tokens to the configured upstream
-    and answers everything else with 403, logging it to `reject_log`. The sandboxed worker's only
-    network allow is this port, so the worker can't reach other Ollama endpoints (pull, delete, ...)."""
+    It forwards only POST /v1/messages and POST /v1/messages/count_tokens to the configured upstream,
+    plus read-only GET/HEAD on the fixed registry routes (REGISTRY_ROUTES), and answers everything else
+    with 403, logging it to `reject_log`. There is no CONNECT: the helper makes every outbound TLS
+    connection itself, so it sees and filters the HTTP. The sandboxed worker's only network allow is this
+    port, so it can't reach other Ollama endpoints (pull, delete, ...).
 
-    def __init__(self, upstream_url, reject_log, max_body=PROXY_MAX_BODY):
+    `routes`, `connector` and the limits are injectable so tests can point routes at a local server."""
+
+    def __init__(self, upstream_url, reject_log, max_body=PROXY_MAX_BODY, routes=None, connector=None,
+                 max_conns=PROXY_MAX_CONNS, max_upstream=PROXY_MAX_UPSTREAM, header_deadline=PROXY_HEADER_DEADLINE,
+                 run_budget=PROXY_RUN_BUDGET, rewrite_cap=PROXY_REWRITE_CAP, upstream_wait=30, request_log=None, registries=()):
         up = urlsplit(upstream_url)
         self.scheme, self.host = up.scheme, up.hostname
         self.port = up.port or (443 if up.scheme == "https" else 80)
         self.reject_log, self.max_body = reject_log, max_body
+        self.routes = dict({p: REGISTRY_ROUTES[p] for n in registries for p in REGISTRY_GROUPS[n]}
+                           if routes is None else routes)
+        self.connector = connector or (lambda host, port, scheme: connect_registry(host, port))
+        self.max_conns, self.header_deadline = max_conns, header_deadline
+        self.run_budget, self.rewrite_cap, self.upstream_wait = run_budget, rewrite_cap, upstream_wait
+        self.downloaded = 0
+        self.request_log = request_log or os.path.join(os.path.dirname(reject_log) or ".", "registry_requests.log")
+        self.requests = 0
+        self.packages = []
+        self._slots = threading.BoundedSemaphore(max_upstream)
         self._lock = threading.Lock()
         self._conns = set()
         self._socks = set()
         self._stopped = False
-        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
-        self.httpd.daemon_threads = True
+        self.httpd = _ProxyServer(("127.0.0.1", 0), self._handler(), self)
         self.port_local = self.httpd.server_address[1]
+        self.url = f"http://127.0.0.1:{self.port_local}"
         self._thread = None
 
     def log_reject(self, method, path):
@@ -450,15 +672,81 @@ class EgressProxy:
             with open(self.reject_log, "a") as f:
                 f.write(line)
 
+    def log_request(self, method, path, status, nbytes, prefix, rest):
+        """One line per /r/ request in registry_requests.log, plus the count and distinct first segments."""
+        line = "%s %s %s %s %d\n" % (time.strftime("%Y-%m-%dT%H:%M:%S%z"), method[:16],
+                                     path[:512].encode("unicode_escape").decode("ascii"), status, nbytes)
+        seg = registry_package(prefix, rest)[:100].encode("unicode_escape").decode("ascii")
+        with self._lock:
+            self.requests += 1
+            if seg and seg not in self.packages and len(self.packages) < 50:
+                self.packages.append(seg)
+            with open(self.request_log, "a") as f:
+                f.write(line)
+
+    def registry_summary(self):
+        with self._lock:
+            return {"count": self.requests, "packages": list(self.packages)}
+
     def _upstream(self):
         cls = http.client.HTTPSConnection if self.scheme == "https" else http.client.HTTPConnection
         return cls(self.host, self.port, timeout=PROXY_UPSTREAM_TIMEOUT)
+
+    # ---- registry helpers
+
+    def match_route(self, target):
+        """(prefix, upstream base, decoded rest, query) for a safe /r/ target, else None."""
+        path, _, query = target.partition("?")
+        for prefix, base in self.routes.items():
+            if path.startswith(prefix):
+                rest = path[len(prefix):]
+                break
+        else:
+            return None
+        try:
+            decoded = unquote(rest, errors="strict")  # once
+        except UnicodeDecodeError:
+            return None
+        if (decoded.startswith("/") or ".." in decoded or "//" in decoded or "\\" in decoded
+                or any(ord(c) < 32 or ord(c) == 127 for c in decoded)):
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9%._~!$&'()*+,;=:@/?-]*", query):
+            return None
+        return prefix, base, decoded, query
+
+    def map_location(self, url):
+        """A table upstream URL as the matching proxy URL, or None if it points anywhere else."""
+        for prefix, base in self.routes.items():
+            if url.startswith(base):
+                return self.url + prefix + url[len(base):]
+        return None
+
+    def rewrite_for(self, prefix, rest, ctype):
+        """The body rewrite for this response: None, 'crates-config', or a (old, new) string pair."""
+        ctype = (ctype or "").lower()
+        if prefix == "/r/pypi/" and rest.startswith("simple/") and ("html" in ctype or "json" in ctype):
+            return ("https://files.pythonhosted.org/", self.url + "/r/pyfiles/")
+        if prefix == "/r/npm/" and "json" in ctype:
+            return ("https://registry.npmjs.org/", self.url + "/r/npm/")
+        if prefix == "/r/crates-index/" and rest == "config.json":
+            return "crates-config"
+        return None
+
+    def rewrite_body(self, rule, data):
+        if rule == "crates-config":
+            cfg = json.loads(data)
+            cfg["dl"] = self.url + "/r/crates-static/crates"
+            cfg["api"] = None
+            return json.dumps(cfg).encode()
+        old, new = rule
+        return data.replace(old.encode(), new.encode())
 
     def _handler(self):
         proxy = self
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
+            timeout = PROXY_CLIENT_TIMEOUT
 
             def log_message(self, *a):
                 pass
@@ -478,25 +766,57 @@ class EgressProxy:
                 except OSError:
                     pass
 
+            # 60 s to read a full request line and headers, however slowly the bytes arrive.
+            def handle_one_request(self):
+                timer = threading.Timer(proxy.header_deadline, self._deadline)
+                timer.daemon = True
+                self._timer = timer
+                timer.start()
+                try:
+                    super().handle_one_request()
+                finally:
+                    timer.cancel()
+
+            def _deadline(self):
+                self.close_connection = True
+                try:
+                    self.request.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+            def send_response(self, code, message=None):
+                self._code = code
+                super().send_response(code, message)
+
+            def parse_request(self):
+                self._sent, self._code = 0, 0
+                ok = super().parse_request()
+                self._timer.cancel()
+                return ok
+
             def _reply(self, code, text):
                 body = (text + "\n").encode()
                 self.close_connection = True
+                self._sent = getattr(self, "_sent", 0) + (0 if self.command == "HEAD" else len(body))
                 self.send_response(code)
                 self.send_header("Content-Type", "text/plain")
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Connection", "close")
                 self.end_headers()
-                self.wfile.write(body)
+                if self.command != "HEAD":
+                    self.wfile.write(body)
 
             def _reject(self):
                 proxy.log_reject(self.command, self.path)
                 self._reply(403, "forbidden by offload egress proxy")
 
-            do_GET = do_PUT = do_DELETE = do_PATCH = do_HEAD = do_OPTIONS = _reject
+            do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_CONNECT = do_TRACE = _reject
 
             def send_error(self, code, message=None, explain=None):
                 if code == 501:  # unknown method
                     proxy.log_reject(self.command or "?", self.path or "?")
+                    self.close_connection = True
+                    return self._reply(403, "forbidden by offload egress proxy")
                 self.close_connection = True
                 super().send_error(code, message, explain)
 
@@ -571,6 +891,117 @@ class EgressProxy:
                     with proxy._lock:
                         proxy._conns.discard(conn)
                     conn.close()
+
+            # ---- read-only registry routes
+
+            def do_GET(self):
+                route = self.path.startswith("/r/") and proxy.match_route(self.path)
+                has_body = (self.headers.get("Transfer-Encoding") is not None
+                            or self.headers.get("Content-Length", "0").strip() not in ("", "0"))
+                if not route or has_body:
+                    return self._reject()
+                try:
+                    if proxy.downloaded >= proxy.run_budget:
+                        proxy.log_reject(self.command, self.path + " [download budget used]")
+                        return self._reply(403, "download budget used")
+                    if not proxy._slots.acquire(timeout=proxy.upstream_wait):
+                        return self._reply(503, "too many upstream requests")
+                    try:
+                        self._registry(*route)
+                    finally:
+                        proxy._slots.release()
+                finally:
+                    proxy.log_request(self.command, self.path, self._code, self._sent, route[0], route[2])
+
+            do_HEAD = do_GET
+
+            def _registry(self, prefix, base, rest, query):
+                up = urlsplit(base)
+                port = up.port or (443 if up.scheme == "https" else 80)
+                upath = up.path.rstrip("/") + "/" + quote(rest, safe="/@:+,;=~!$&'()*-._")
+                if query:
+                    upath += "?" + query
+                hdrs = {"User-Agent": "offload", "Accept-Encoding": "identity", "Connection": "close",
+                        "Accept": self.headers.get("Accept", "*/*")}
+                for k in ("If-None-Match", "If-Modified-Since"):
+                    if self.headers.get(k):
+                        hdrs[k] = self.headers[k]
+                conn = None
+                try:
+                    try:
+                        conn = proxy.connector(up.hostname, port, up.scheme)
+                        with proxy._lock:
+                            proxy._conns.add(conn)
+                        conn.request(self.command, upath, headers=hdrs)
+                        resp = conn.getresponse()
+                    except (OSError, http.client.HTTPException, ssl.SSLError) as e:
+                        return self._reply(502, f"upstream error: {type(e).__name__}")
+                    self.close_connection = True
+                    if resp.status in (301, 302, 303, 307, 308):
+                        loc = resp.getheader("Location")
+                        mapped = (proxy.map_location(urljoin(f"{up.scheme}://{up.netloc}{upath}", loc))
+                                  if loc else None)
+                        if not mapped:
+                            return self._reply(502, "redirect to a host that is not routed")
+                        self.send_response(resp.status)
+                        self.send_header("Location", mapped)
+                        self.send_header("Content-Length", "0")
+                        self.send_header("Connection", "close")
+                        return self.end_headers()
+                    ctype = resp.getheader("Content-Type")
+                    rule = proxy.rewrite_for(prefix, rest, ctype) if resp.status == 200 else None
+                    if rule and resp.getheader("Content-Encoding", "identity").lower() != "identity":
+                        return self._reply(502, "encoded body cannot be rewritten")
+                    data = None
+                    if rule and self.command != "HEAD":
+                        data = resp.read(proxy.rewrite_cap + 1)
+                        with proxy._lock:
+                            proxy.downloaded += len(data)  # every byte read from upstream counts
+                        if len(data) > proxy.rewrite_cap:
+                            return self._reply(502, "metadata too large to rewrite")
+                        try:
+                            data = proxy.rewrite_body(rule, data)
+                        except ValueError:
+                            return self._reply(502, "metadata could not be rewritten")
+                    self.send_response(resp.status)
+                    for k in ("Content-Type", "ETag", "Last-Modified", "Cache-Control"):
+                        if resp.getheader(k):
+                            self.send_header(k, resp.getheader(k))
+                    self.send_header("Connection", "close")
+                    if rule:  # the body changes, so the upstream length no longer applies
+                        if data is not None:
+                            self.send_header("Content-Length", str(len(data)))
+                        self.end_headers()
+                        if data is not None:
+                            self._send_counted(data, count=False)
+                        return
+                    if resp.getheader("Content-Length"):
+                        self.send_header("Content-Length", resp.getheader("Content-Length"))
+                    self.end_headers()
+                    if self.command == "HEAD":
+                        return
+                    while True:
+                        chunk = resp.read1(65536)
+                        if not chunk:
+                            break
+                        self._send_counted(chunk)
+                        if proxy.downloaded >= proxy.run_budget:
+                            break
+                except OSError:
+                    pass
+                finally:
+                    if conn is not None:
+                        with proxy._lock:
+                            proxy._conns.discard(conn)
+                        conn.close()
+
+            def _send_counted(self, chunk, count=True):
+                if count:
+                    with proxy._lock:
+                        proxy.downloaded += len(chunk)
+                self._sent += len(chunk)
+                self.wfile.write(chunk)
+                self.wfile.flush()
 
         return Handler
 
@@ -714,7 +1145,7 @@ def write_profile(ctx, proxy_port=None, src_dir=None, path=None):
 
 
 def prepare_run(repo, slug, ohome, model=DEFAULT_MODEL, base=None, claude=None, allow_read=(),
-                max_thinking=DEFAULT_MAX_THINKING, max_turns=DEFAULT_MAX_TURNS):
+                max_thinking=DEFAULT_MAX_THINKING, max_turns=DEFAULT_MAX_TURNS, registries=()):
     """Run-flow steps 1 (partly), 2, 3 and the profile of step 4. Returns the run context.
 
     The profile written here has no network allow; cmd_run rewrites it once the proxy port is known."""
@@ -729,6 +1160,8 @@ def prepare_run(repo, slug, ohome, model=DEFAULT_MODEL, base=None, claude=None, 
     if os.path.lexists(run_dir):
         raise OffloadError(f"run directory already exists: {run_dir}")
     allow = [validate_allow_read(p, repo_root=root) for p in allow_read]
+    defaults, warnings = default_read_roots(repo_root=root)
+    allow += [d for d in defaults if d not in allow]
     check_branch_free(root, slug, "/var/empty")
     os.makedirs(os.path.dirname(run_dir), mode=0o700, exist_ok=True)
     os.mkdir(run_dir, 0o700)
@@ -737,8 +1170,10 @@ def prepare_run(repo, slug, ohome, model=DEFAULT_MODEL, base=None, claude=None, 
     ghome = os.path.join(run_dir, "home")
     ctx = {"run_id": run_id, "run_dir": run_dir, "repo": root, "slug": slug, "model": model, "base": base,
            "claude": claude, "allow_read": allow, "max_thinking": max_thinking, "max_turns": max_turns,
+           "registries": list(registries),
            "git_dir": os.path.join(run_dir, "git"), "src": os.path.join(run_dir, "src"),
-           "profile": os.path.join(run_dir, "profile.sb"), "ghome": ghome, "proxy_port": None}
+           "profile": os.path.join(run_dir, "profile.sb"), "ghome": ghome, "proxy_port": None,
+           "warnings": warnings}
     try:
         ctx["base_sha"] = safe_git(["-C", root, "rev-parse", "HEAD"], ghome).stdout.strip()
         safe_git(["clone", "--bare", "--no-local", "--no-hardlinks", root, ctx["git_dir"]], ghome)
@@ -757,9 +1192,25 @@ def prepare_run(repo, slug, ohome, model=DEFAULT_MODEL, base=None, claude=None, 
     ctx["record"] = {"run_id": run_id, "run_dir": run_dir, "repo": root, "slug": slug, "model": model,
                      "branch": f"offload/{slug}", "base_sha": ctx["base_sha"], "base_url": base["url"],
                      "status": "prepared", "created": time.time(), "max_turns": max_turns,
-                     "claude": claude, "allow_read": allow}
+                     "claude": claude, "allow_read": allow, "warnings": warnings,
+                     "registries": list(registries)}
     write_run_json(run_dir, ctx["record"])
     return ctx
+
+
+def init_worker_git(ctx):
+    """Give the worker a local repo in src: init and a `base` commit through the safe-git wrapper, with
+    --git-dir src/.git --work-tree src so the safe-git config applies. The helper never runs git against
+    src/.git after this; commit_work deletes it before collecting."""
+    gh = ctx["ghome"]
+    gd = os.path.join(ctx["src"], ".git")
+    git = ["--git-dir", gd, "--work-tree", ctx["src"]]
+    safe_git(git + ["init", "-q"], gh)
+    safe_git(git + ["config", "user.name", "offload"], gh)
+    safe_git(git + ["config", "user.email", "offload@localhost"], gh)
+    safe_git(git + ["config", "commit.gpgsign", "false"], gh)
+    safe_git(git + ["add", "-A"], gh)
+    safe_git(git + ["commit", "-q", "--no-verify", "--allow-empty", "-m", "base"], gh)
 
 
 def sandbox_argv(profile, argv):
@@ -771,11 +1222,38 @@ def worker_url(ctx):
     return f"http://127.0.0.1:{ctx.get('proxy_port') or 1}"
 
 
-def run_selftest(ctx):
+def _probe_conn_limit(port, limit=PROXY_MAX_CONNS):
+    """Hold `limit` idle connections to the proxy; the next one must be closed by the proxy at once."""
+    time.sleep(0.3)  # let earlier probe connections drain
+    held = []
+    try:
+        for _ in range(limit):
+            held.append(socket.create_connection(("127.0.0.1", port), timeout=3))
+        extra = socket.create_connection(("127.0.0.1", port), timeout=3)
+        held.append(extra)
+        extra.settimeout(3)
+        try:
+            closed = extra.recv(1) == b""
+        except socket.timeout:
+            closed = False
+        except OSError:
+            closed = True
+        return closed, "closed" if closed else "left open"
+    except OSError as e:
+        return False, f"{type(e).__name__}"
+    finally:
+        for c in held:
+            c.close()
+
+
+def run_selftest(ctx, online=None):
     """Deterministic sandbox checks, no model. Returns (ok, results).
 
-    When ctx['proxy_port'] is set the proxy must be up; the worker profile then allows that one port."""
-    env = build_worker_env(ctx["run_dir"], ctx["model"], worker_url(ctx), ctx["max_thinking"])
+    When ctx['proxy_port'] is set the proxy must be up; the worker profile then allows that one port.
+    `online` says whether to run the probe that fetches a real registry page; None means run it only when
+    pypi.org resolves from here (it is skipped when offline)."""
+    env = build_worker_env(ctx["run_dir"], ctx["model"], worker_url(ctx), ctx["max_thinking"],
+                           allow_read=ctx.get("allow_read", ()), registries=ctx.get("registries", ()))
     hm = real_home()
     results = []
     curl = "/usr/bin/curl"
@@ -828,6 +1306,39 @@ def run_selftest(ctx):
                     f"http://127.0.0.1:{ctx['proxy_port']}/api/pull", "-d", "{}"])
             record("proxy answers 403 for POST /api/pull", p.stdout.strip() == "403",
                    f"http {p.stdout.strip()!r} exit {p.returncode}")
+            port = ctx["proxy_port"]
+            base = f"http://127.0.0.1:{port}"
+
+            def code_of(name, args):
+                q = sb([curl, "-s", "-m", "5", "-o", "/dev/null", "-w", "%{http_code}", *args])
+                record(name, q.stdout.strip() == "403", f"http {q.stdout.strip()!r} exit {q.returncode}")
+
+            q = sb([curl, "-s", "-m", "5", "-p", "-x", base, "-o", "/dev/null", "-w", "%{http_connect}",
+                    "https://pypi.org/"])
+            record("proxy answers 403 for CONNECT pypi.org:443", q.stdout.strip() == "403",
+                   f"http {q.stdout.strip()!r} exit {q.returncode}")
+            code_of("proxy answers 403 for an absolute-form GET", ["-x", base, "http://example.com/"])
+            code_of("proxy answers 403 for PUT /r/npm/x", ["-X", "PUT", f"{base}/r/npm/x"])
+            code_of("proxy answers 403 for GET /r/pypi/../../x", ["--path-as-is", f"{base}/r/pypi/../../x"])
+            code_of("proxy answers 403 for GET /r/nope/", [f"{base}/r/nope/"])
+            if "pypi" not in ctx.get("registries", ()):
+                code_of("proxy answers 403 for GET /r/pypi/simple/pip/ (pypi not enabled)", [f"{base}/r/pypi/simple/pip/"])
+            else:
+                if online is None:
+                    try:
+                        socket.getaddrinfo("pypi.org", 443)
+                        online = True
+                    except OSError:
+                        online = False
+                if online:
+                    q = sb([curl, "-s", "-m", "20", "-w", "\n%{http_code}", f"{base}/r/pypi/simple/pip/"], timeout=30)
+                    body, _, code = q.stdout.rpartition("\n")
+                    record("proxy serves /r/pypi/simple/pip/ with rewritten links",
+                           code.strip() == "200" and "files.pythonhosted.org" not in body and "/r/pyfiles/" in body,
+                           f"http {code.strip()!r} exit {q.returncode}")
+                else:
+                    record("proxy serves /r/pypi/simple/pip/ (offline, skipped)", True)
+            record("the 33rd concurrent proxy connection is closed", *_probe_conn_limit(port))
     if os.path.exists("/usr/bin/pbpaste"):
         p = sb(["/usr/bin/pbpaste"], binary=True)  # never printed or stored: only the byte count
         record("pbpaste yields nothing", p.returncode != 0 or len(p.stdout) == 0, f"exit {p.returncode}, {len(p.stdout)} bytes")
@@ -981,12 +1492,18 @@ def pump(proc, timeout_s, on_data):
         sel.close()
 
 
+WORKER_PREAMBLE = ("You are working in a copy of the repo, in the current directory. git works locally: there is "
+                   "no remote. There is no network except the model. Make temp files with "
+                   "`mktemp -d \"$TMPDIR/x.XXXXXX\"`. Write the code and tests the brief asks for, run the tests, "
+                   "commit if you like, and finish with a short summary.\n\n")
+
+
 def launch_worker(ctx, brief_text, timeout_s):
     """Step 5/6: run the worker, reading stream-json incrementally. Returns an outcome dict."""
-    env = build_worker_env(ctx["run_dir"], ctx["model"], worker_url(ctx), ctx["max_thinking"])
+    env = build_worker_env(ctx["run_dir"], ctx["model"], worker_url(ctx), ctx["max_thinking"],
+                           allow_read=ctx.get("allow_read", ()), registries=ctx.get("registries", ()))
     argv = sandbox_argv(ctx["profile"], build_claude_argv(ctx["claude"]["real"], ctx["max_turns"]))
-    preamble = ("You are working in the current directory only. There is no git and no network. "
-                "Write the code and tests the brief asks for, run the tests, and finish with a short summary.\n\n")
+    preamble = WORKER_PREAMBLE
     log_path = os.path.join(ctx["run_dir"], "worker.jsonl")
     out = {"init_problems": [], "saw_init": False, "timed_out": False, "result": None, "usage": {},
            "text": "", "log_path": log_path, "survivors_killed": []}
@@ -1105,7 +1622,7 @@ def load_run(ohome, run_id):
 def ctx_from_record(rec):
     rd = rec["run_dir"]
     return {"run_id": rec["run_id"], "run_dir": rd, "repo": rec["repo"], "slug": rec["slug"], "model": rec["model"],
-            "claude": rec.get("claude"), "allow_read": rec.get("allow_read") or [], "proxy_port": None,
+            "claude": rec.get("claude"), "allow_read": rec.get("allow_read") or [], "registries": rec.get("registries") or [], "proxy_port": None,
             "git_dir": os.path.join(rd, "git"), "src": os.path.join(rd, "src"),
             "profile": os.path.join(rd, "profile.sb"), "ghome": os.path.join(rd, "home"),
             "max_thinking": DEFAULT_MAX_THINKING}
@@ -1148,10 +1665,11 @@ def cmd_run(args, ohome):
     with open(args.brief, encoding="utf-8") as f:
         brief = f.read()
     slug = validate_slug(args.slug or default_slug(args.brief))
+    registries = parse_registries(args.registries)
     claude = resolve_claude(args.allow_untested_claude)
     base = resolve_base_url(args.base_url)
     ctx = prepare_run(args.repo, slug, ohome, args.model, base, claude, args.allow_read,
-                      args.max_thinking_tokens, args.max_turns)
+                      args.max_thinking_tokens, args.max_turns, registries)
     rec = ctx["record"]
 
     def finish(status, extra=None):
@@ -1165,13 +1683,17 @@ def cmd_run(args, ohome):
            "base_sha": ctx["base_sha"], "head_sha": None, "model": args.model, "turns": 0, "duration_s": 0,
            "usage": {"input": 0, "cache_read": 0, "output": 0}, "est_cost_usd": None, "untrusted_diffstat": "",
            "untrusted_sensitive_paths": [], "untrusted_worker_text": "", "format_chars": 0,
-           "survivors_killed": [], "log_path": os.path.join(ctx["run_dir"], "worker.jsonl")}
+           "survivors_killed": [], "log_path": os.path.join(ctx["run_dir"], "worker.jsonl"),
+           "warnings": ctx["warnings"], "registries": registries}
     head = None
     try:
-        proxy = EgressProxy(base["url"], os.path.join(ctx["run_dir"], "proxy_rejects.log"))
+        init_worker_git(ctx)
+        proxy = EgressProxy(base["url"], os.path.join(ctx["run_dir"], "proxy_rejects.log"),
+                           registries=ctx["registries"])
         try:
             ctx["proxy_port"] = proxy.start()
             write_profile(ctx, ctx["proxy_port"])
+            write_registry_configs(ctx["run_dir"], worker_url(ctx), ctx["registries"])
             ok, checks = run_selftest(ctx)
             if not ok:
                 out.update(status="sandbox_selftest_failed", selftest=checks)
@@ -1182,6 +1704,7 @@ def cmd_run(args, ohome):
             w = launch_worker(ctx, brief, args.timeout_min * 60)
         finally:
             proxy.stop()  # as soon as the worker ends, times out, or fails the init check
+        out["registry_requests"] = rec["registry_requests"] = proxy.registry_summary()
         out.update(turns=w["turns"], usage=w["usage"], est_cost_usd=estimate_cost(args.model, w["usage"]),
                    survivors_killed=w["survivors_killed"])
         if w["init_problems"] or not w["saw_init"]:
@@ -1281,7 +1804,8 @@ def cmd_test(args, ohome):
         if not ok:
             emit({"status": "sandbox_selftest_failed", "selftest": checks})
             return 1
-        env = build_worker_env(ctx["run_dir"], ctx["model"], worker_url(tctx))
+        env = build_worker_env(ctx["run_dir"], ctx["model"], worker_url(tctx), allow_read=ctx["allow_read"],
+                               registries=ctx.get("registries", ()))
         proc = subprocess.Popen(sandbox_argv(tprofile, cmd), cwd=testsrc, env=env, shell=False,
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 start_new_session=True)
@@ -1394,6 +1918,7 @@ def build_parser():
     r.add_argument("--max-thinking-tokens", type=int, default=DEFAULT_MAX_THINKING)
     r.add_argument("--allow-read", action="append", default=[])
     r.add_argument("--base-url")
+    r.add_argument("--registries", default="", metavar="LIST")
     r.add_argument("--allow-untested-claude", action="store_true")
     t = sub.add_parser("test")
     t.add_argument("--run", required=True)

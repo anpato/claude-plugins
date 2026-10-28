@@ -42,9 +42,17 @@ The worker model and all it writes are untrusted.
 - Every git command runs through one wrapper that disables hooks, global config, fsmonitor and attribute files.
 - Text coming back is truncated and stripped of control characters, and the skill tells Claude to treat it as data.
 
+## What the worker can do
+
+- Work like Claude in a repo: `git` (local, no remote), `python3`, temp files (`mktemp -d "$TMPDIR/x.XXXXXX"`) and zsh heredocs all work in the sandbox. The Command Line Tools come first on its PATH.
+- Install dependencies from pypi, npm, crates.io and maven through the same loopback port, only for the registries you enable per run with `--registries pypi,npm,crates,maven` (off by default). The proxy serves read-only `GET`/`HEAD` on six fixed routes (`/r/pypi/`, `/r/pyfiles/`, `/r/npm/`, `/r/crates-index/`, `/r/crates-static/`, `/r/maven/`), rebuilds the headers, blocks private addresses and does not follow redirects. There is no CONNECT and no `HTTPS_PROXY`. Go modules are not fetched: use `--allow-read ~/go/pkg/mod`.
+- Read `~/.rustup` by default when it exists (public content only). Every registry request is logged to `<run>/registry_requests.log` and summarised as `registry_requests` in the run output.
+- Take up to 60 turns by default (`--max-turns`).
+- Dependency files it changes (`requirements.txt`, `Cargo.toml`, `go.mod`, `pom.xml`, `*.gradle`) are flagged for review.
+
 ## Limitations
 
-- The worker has no network: dependencies must be vendored or exposed read-only with `--allow-read`.
+- The worker has no general network. Registry downloads go through the proxy; anything else must be vendored or exposed read-only with `--allow-read`.
 - The worker sees tracked files at HEAD only. Secrets committed to the repo are visible to it and leave through its model calls.
 - The worker can still send extra `/v1/messages` calls through the proxy, which bill to your Ollama account.
 - `--allow-read` accepts only an allowlist of toolchain caches (`~/go/pkg/mod`, `~/.cargo/registry`, `~/.cargo/git`, `~/.rustup`, `~/.m2/repository`, `~/.gradle/caches`, `~/.npm/_cacache`, and the repo's `node_modules`, `vendor`, `.venv`).

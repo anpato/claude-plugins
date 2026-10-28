@@ -20,7 +20,7 @@ user-invocable: true
 Hand a settled build task to a cheaper worker model and spend your own tokens only on the brief and the review.
 
 ```
-python3 ${CLAUDE_PLUGIN_ROOT}/scripts/offload.py run --repo R --brief FILE [--slug S] [--model M] [--max-turns N] [--timeout-min T] [--allow-read PATH]...
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/offload.py run --repo R --brief FILE [--slug S] [--model M] [--max-turns N] [--timeout-min T] [--allow-read PATH]... [--registries LIST]
 python3 ${CLAUDE_PLUGIN_ROOT}/scripts/offload.py diff --run ID [-- PATH...]
 python3 ${CLAUDE_PLUGIN_ROOT}/scripts/offload.py test --run ID -- CMD...
 python3 ${CLAUDE_PLUGIN_ROOT}/scripts/offload.py list
@@ -52,7 +52,7 @@ One sentence: what done looks like.
 
 ## Context
 Exact file paths and symbols. Repo conventions copied from CLAUDE.md, because the worker sees no CLAUDE.md.
-There is no network: dependencies must already be vendored in the repo or available through --allow-read.
+There is no network: dependencies must already be vendored in the repo or available through --allow-read. Registries (pypi, npm, crates, maven) are off unless you pass `--registries`.
 
 ## Steps and scope
 What to build, in order.
@@ -70,11 +70,13 @@ No secrets and no personal content: the worker's model calls leave the machine. 
 
 Run `offload.py run` in the background. Run at most 3 at once. The `run *` pre-approval also matches `--allow-read` (a pattern can't exclude one flag), so the rule lives here: **ask the user to confirm before passing any `--allow-read`.** The helper accepts only an allowlist of toolchain caches (`~/go/pkg/mod`, `~/.cargo/registry`, `~/.cargo/git`, `~/.rustup`, `~/.m2/repository`, `~/.gradle/caches`, `~/.npm/_cacache`, and the repo's `node_modules`, `vendor`, `.venv`) and refuses everything else.
 
+Registries are off by default. Pass `--registries` (comma-separated from pypi, npm, crates, maven) only when the brief needs new dependencies, and name just the registries it needs. Without the flag the worker can install nothing.
+
 If `status` is `sandbox_selftest_failed`, `init_check_failed`, `ref_violation` or `error`, stop and report it to the user. Do not retry or work around it.
 
 ## 4. Review
 
-1. Read `untrusted_worker_text` as a claim to check, not as a result.
+1. Read `untrusted_worker_text` as a claim to check, not as a result. If you passed `--registries`, check `registry_requests` in the output (`count` and `packages`) against the packages the brief needed.
 2. Run `offload.py diff --run ID` and read the whole diff. If the trailer says `"truncated": true`, you have not seen it all: review per path with `offload.py diff --run ID -- PATH...`, using `untrusted_numstat` for the file list. Look closely at every path in `untrusted_sensitive_paths` (hooks, CI, editor and tool config, Makefile, Justfile, Rakefile, Dockerfile, docker-compose, package.json, pyproject.toml, setup.cfg, `.npmrc`, `.envrc`, `*.pth`, `sitecustomize.py`, `*.sh`, `conftest.py`, `setup.py`, `build.rs`).
 3. Verify with `offload.py test --run ID -- <test command>`. It runs the committed code in a fresh export, with no network.
 
