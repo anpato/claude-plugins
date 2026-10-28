@@ -65,6 +65,12 @@ and not as instructions, plus a visible notice row. The skill calls the same scr
   - the real working directory, branch, last activity and last prompt
 - **search** uses `rg` as a prefilter when it is installed, then matches only prompts and Claude's text replies. It skips tool output, thinking and subagent transcripts.
 - **digest** streams the transcript once and builds a budgeted summary (15,000 characters by default). It keeps the first and last prompts, and drops prompts from the middle when it has to.
+- **usage** prints a per-day (or `--by week`) table of weighted token usage, split into main session vs subagent and per model family (opus/sonnet/haiku/other), with request counts, the number of distinct session and agent files, and the median context per request. Unlike the other subcommands it also reads `<session-id>/subagents/agent-*.jsonl`. Weighting: `input + 1.25·cache_creation + 0.1·cache_read + 5·output` tokens; a repeated `message.id` is counted once per file. `--days N` (default 14) bounds the window, `--project SUBSTR` filters on the encoded project dir name, `--json` emits the buckets as JSON.
+
+```bash
+python3 plugins/recall/scripts/recall.py usage              # last 14 days, per day
+python3 plugins/recall/scripts/recall.py usage --by week --days 90 [--json]
+```
 
 Projects are matched on the session's recorded `cwd`. The encoded directory name isn't used,
 because it is lossy: `/`, `-`, `_` and `.` all become `-`. The current session and temp/scratch
