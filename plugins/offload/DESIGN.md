@@ -209,6 +209,10 @@ git and `xcrun_db-`). Decisions:
   port in the start snapshot, so the worker cannot take over a host listener's loopback clients (for example by
   binding 127.0.0.1:P with `SO_REUSEADDR` while the host listens on 0.0.0.0:P). Because that makes the snapshot
   security-relevant, **the run refuses to start if the `netstat -anv -p tcp` snapshot fails or finds no listeners.**
+  Under a non-Apple python (Homebrew, uv) the kernel returns no socket records to that process tree, so netstat
+  prints none; the snapshot then falls back to `lsof -iTCP -sTCP:LISTEN`, which sees this user's listeners but not
+  root's. Root listeners above 1023 (here launchd's 8021, wifiman's IPv4-only 63150, whose `::1:63150` the worker
+  could bind) are then unprotected. Measured 2026-10-29: netstat found 30 ports, lsof 25.
   `run.json` records `host_listeners` (the snapshot, minus the proxy port) and, after the worker exits,
   `worker_listeners` (new LISTEN ports not in that snapshot). A listener the host starts mid-run is not protected.
 - `ALLOW_LISTEN` gates the bind and inbound allows. SBPL cannot tell a loopback listen from a wildcard one, so a

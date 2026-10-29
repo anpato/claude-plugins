@@ -136,18 +136,34 @@ def test_parse_netstat_listeners():
     assert offload.parse_netstat_listeners("") == set()
 
 
+def test_parse_lsof_listeners():
+    sample = "p1006\nf11\nn*:53643\np53819\nf20\nn127.0.0.1:4410\nf21\nn[::1]:18080\nfcwd\nn/Users/x\n"
+    assert offload.parse_lsof_listeners(sample) == {53643, 4410, 18080}
+    assert offload.parse_lsof_listeners("") == set()
+
+
 def test_snapshot_listen_ports_sees_a_listener():
     srv = socket.socket()
     srv.bind(("127.0.0.1", 0))
     srv.listen()
     try:
-        try:
-            ports = offload.snapshot_listen_ports()
-        except offload.OffloadError:
-            pytest.skip("netstat shows no TCP sockets in this process tree (seen under Homebrew python in the agent shell)")
-        assert srv.getsockname()[1] in ports
+        assert srv.getsockname()[1] in offload.snapshot_listen_ports()
     finally:
         srv.close()
+
+
+def test_snapshot_listen_ports_falls_back_to_lsof(monkeypatch):
+    def fake_run(argv, **kw):
+        out = "" if argv[0].endswith("netstat") else "p1\nf3\nn127.0.0.1:4410\n"
+        return subprocess.CompletedProcess(argv, 0, out, "")
+    monkeypatch.setattr(offload.subprocess, "run", fake_run)
+    assert offload.snapshot_listen_ports() == {4410}
+
+
+def test_snapshot_listen_ports_fails_closed_when_both_empty(monkeypatch):
+    monkeypatch.setattr(offload.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", ""))
+    with pytest.raises(offload.OffloadError, match="snapshot host listeners"):
+        offload.snapshot_listen_ports()
 
 
 def test_snapshot_listen_ports_fails_closed(monkeypatch):
