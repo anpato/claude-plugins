@@ -44,7 +44,7 @@ how many are running.
 ## Offload runs
 
 Runs under `~/.cache/offload/runs/*/run.json` (checked every 5 s, only if the directory exists)
-appear as `offload` rows: `prepared` or `running` runs while live, and `ok`, `failed` or `timeout`
+that this session started (their `session_id` matches) appear as `offload` rows: `prepared` or `running` runs while live, and `ok`, `failed` or `timeout`
 runs for an hour after they end. A missing or malformed `run.json` is skipped.
 
 ## Install

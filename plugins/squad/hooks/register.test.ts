@@ -197,6 +197,7 @@ const sessionStub = (on: Parameters<typeof mock.env>[0]) => {
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
   on('tool.register', (_$, e) => ({ value: { tool: `mcp__squad__${e.name}` } }))
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('session.id', () => ({ value: 'me' }))
 }
 const startSession = ($: any) => $.session.start({ source: 'startup', cwd: '/', surface: null, isInteractive: true } as never)
 
@@ -284,7 +285,8 @@ test('stallAfterSec moves the idle threshold', { options: { stallAfterSec: 30 } 
   await ui.unmount()
 })
 
-const runJson = (o: Record<string, unknown>) => JSON.stringify(o)
+// A run.json this session started, unless `o` says otherwise.
+const runJson = (o: Record<string, unknown>) => JSON.stringify({ session_id: 'me', ...o })
 
 test('offload runs show as rows, and bad files are skipped', async ($, on) => {
   const clock = mock.clock(on, { now: 10_000_000 })
@@ -299,6 +301,8 @@ test('offload runs show as rows, and bad files are skipped', async ($, on) => {
     r4: runJson({ run_id: 'r4', slug: 'ancient', status: 'ok', created: nowS - 9000, ended_at: nowS - 8000 }),
     r5: '{not json',
     r6: runJson({ run_id: 'r6', slug: 'prepared-one', status: 'prepared' }),
+    r7: runJson({ run_id: 'r7', slug: 'other-session', status: 'running', created: nowS - 10, session_id: 'them' }),
+    r8: runJson({ run_id: 'r8', slug: 'no-session', status: 'running', created: nowS - 10, session_id: undefined }),
   }
   on('fs.exists', (_$, e) => ({ value: e.path === dir }))
   on('fs.list', () => ({ value: Object.keys(files).map(name => ({ name, kind: 'dir', size: 0, mtimeMs: 0, isLink: false })) }) as never)
@@ -318,6 +322,9 @@ test('offload runs show as rows, and bad files are skipped', async ($, on) => {
   expect(await ui.find({ text: /fresh-done/ })).toBeDefined()
   expect(await ui.find({ text: /bad-run/ })).toBeDefined()
   expect(await ui.find({ text: /ancient/ })).toBeUndefined()
+  // Only this session's runs: not another session's, nor one that names none.
+  expect(await ui.find({ text: /other-session/ })).toBeUndefined()
+  expect(await ui.find({ text: /no-session/ })).toBeUndefined()
   // r1 started 90s before the poll, so its clock reads past 1:30.
   expect(await ui.find({ text: /1:3\d/ })).toBeDefined()
   // The band counts offload runs too, with no subagent running.

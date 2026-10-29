@@ -1618,6 +1618,23 @@ def test_cmd_run_reports_registry_requests(tmp_path, repo, monkeypatch, capsys):
     assert rec["registry_requests"] == {"count": 0, "packages": []}
 
 
+@needs_sandbox
+def test_cmd_run_records_session_id(tmp_path, repo, monkeypatch, capsys):
+    ohome = os.path.realpath(tmp_path / "ohome")
+    brief = tmp_path / "brief.md"
+    brief.write_text("do it\n")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "sess-123")
+    monkeypatch.setattr(offload, "resolve_claude", lambda allow=False: fake_claude())
+    monkeypatch.setattr(offload, "run_selftest", lambda c: (True, []))
+    monkeypatch.setattr(offload, "launch_worker", lambda *a, **k: {
+        "init_problems": [], "saw_init": True, "timed_out": False, "result": {"is_error": False}, "usage": {},
+        "text": "", "returncode": 0, "turns": 1, "survivors_killed": []})
+    assert offload.main(["--home", ohome, "run", "--repo", str(repo), "--brief", str(brief), "--slug", "job"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    rec = json.loads((Path(ohome) / "runs" / out["run_id"] / "run.json").read_text())
+    assert rec["session_id"] == "sess-123"
+
+
 # ------------------------------------------------------------------ registries are off by default (user decision 2026-10-27)
 
 def test_parse_registries():

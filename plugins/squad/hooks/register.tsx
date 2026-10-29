@@ -151,14 +151,14 @@ const callsLabel = (a: SquadAgent): string =>
 const asText = (v: unknown): string | undefined => (typeof v === 'string' && v !== '' ? v : undefined)
 const asSeconds = (v: unknown): number | undefined => (typeof v === 'number' && Number.isFinite(v) ? v : undefined)
 
-// One offload run.json as a row, or undefined when it is malformed or too old.
-// Missing fields are unknown, never an error.
-const offloadRow = (raw: unknown, now: number): SquadAgent | undefined => {
+// One offload run.json as a row, or undefined when it is malformed, too old or
+// started by another session. Missing fields are unknown, never an error.
+const offloadRow = (raw: unknown, now: number, sessionId: string): SquadAgent | undefined => {
   if (typeof raw !== 'object' || raw === null) return undefined
   const r = raw as Record<string, unknown>
   const runId = asText(r.run_id)
   const state = asText(r.status)
-  if (runId === undefined) return undefined
+  if (runId === undefined || r.session_id !== sessionId) return undefined
   const created = asSeconds(r.created)
   const isLive = state === 'running' || state === 'prepared'
   const base = {
@@ -181,11 +181,12 @@ const offloadRow = (raw: unknown, now: number): SquadAgent | undefined => {
   return { ...base, status: state === 'ok' ? 'done' : 'failed', startedAt: created * 1000, endedAt }
 }
 
-// Reads ~/.cache/offload/runs/*/run.json. Any failure yields no rows.
+// Reads this session's runs from ~/.cache/offload/runs/*/run.json. Any failure yields no rows.
 const readOffloadRuns = async ($: EngineInterface, now: number): Promise<SquadAgent[]> => {
   try {
     const home = await $.env.get('HOME')
     if (!home) return []
+    const sessionId = await $.session.id()
     const dir = `${home}/${OFFLOAD_RUNS_DIR}`
     if (!(await $.fs.exists(dir))) return []
     const entries = await $.fs.list(dir)
@@ -194,7 +195,7 @@ const readOffloadRuns = async ($: EngineInterface, now: number): Promise<SquadAg
       if (entry.kind !== 'dir') continue
       try {
         const text = await $.fs.read(`${dir}/${entry.name}/run.json`)
-        const row = offloadRow(JSON.parse(typeof text === 'string' ? text : ''), now)
+        const row = offloadRow(JSON.parse(typeof text === 'string' ? text : ''), now, sessionId)
         if (row !== undefined) rows.push(row)
       } catch {
         // a missing or malformed run.json skips that run only
