@@ -70,7 +70,7 @@ It must not be able to:
    - `ls $HOME` fails.
    - Writing `R/.offload-probe` fails.
    - `curl -m 3 https://example.com` fails, if curl exists.
-   - `curl http://127.0.0.1:11434/api/tags` cannot connect (Ollama is reachable only through the proxy).
+   - Bind, listen and connect on a fresh localhost port works; UDP send to localhost fails (the old "11434 cannot connect" probe is gone: localhost is open, see Scratch dirs and loopback).
    - `curl --unix-socket /var/run/docker.sock` does not connect (skipped if curl or the socket is absent).
    - With the proxy up, `POST /api/pull` through the proxy port gets 403 (this probe is logged in `proxy_rejects.log`).
    - `pbpaste` yields nothing (the output is never printed or stored, only its length).
@@ -83,9 +83,10 @@ It must not be able to:
      Homebrew comes first so `python3` is current (CLT ships 3.9, no `tomllib`). The CLT dir is hard-coded and present
      only if it exists and is root-owned. The helper's own git keeps `SAFE_PATH`.
    - `PYTHONDONTWRITEBYTECODE=1`, so `__pycache__` doesn't land in the commit.
-   - `HOME=home`, `LANG`
+   - `HOME=home`, `LANG`, `USER` and `LOGNAME` (from `getpass.getuser()`; xcodegen refuses to run without one),
+     `UV_PYTHON_DOWNLOADS=never` (python builds come from github, which the proxy does not serve)
    - `TMPDIR` and `CLAUDE_CODE_TMPDIR`, both set to `tmp`, and `TMPPREFIX=tmp/zsh`
-   - registry settings (see "Registry proxy"): `PIP_INDEX_URL`, `PIP_TRUSTED_HOST`, `NPM_CONFIG_REGISTRY`,
+   - registry settings (see "Registry proxy"): `PIP_INDEX_URL`, `PIP_TRUSTED_HOST`, `UV_DEFAULT_INDEX`, `UV_INSECURE_HOST`, `NPM_CONFIG_REGISTRY`,
      `CARGO_HOME=home/.cargo`, `GOPROXY=off`, `GOFLAGS=-mod=mod`, `GOSUMDB=off`, `GOCACHE=tmp/gocache`, and
      `GOMODCACHE` only when `--allow-read ~/go/pkg/mod` was passed
    - `CLAUDE_CONFIG_DIR=config`
@@ -144,13 +145,15 @@ contain `"` or `\`.
 (deny file-write* (subpath "/"))
 (allow file-write* (subpath RUN/src) (subpath RUN/tmp) (subpath RUN/home) (subpath RUN/config)
                    (literal "/dev/null") (literal "/dev/tty") (regex "^/dev/fd/") (regex "^/dev/ttys")
-                   (regex "^<DARWIN_USER_TEMP_DIR>xcrun_db-"))
+                   )
+(allow file-read* file-write* (subpath "/private/tmp") (subpath <T>) (subpath <C>))  ; see "Scratch dirs" below
 (deny mach-lookup (global-name "com.apple.pasteboard.1") (global-name "com.apple.coreservices.launchservicesd")
                   (global-name "com.apple.lsd.mapdb") (global-name "com.apple.lsd.modifydb")
                   (global-name "com.apple.mDNSResponder") (global-name "com.apple.SystemConfiguration.DNSConfiguration"))
 (deny appleevent-send)
 (deny network*)
-(allow network-outbound (remote ip "localhost:<proxy port>"))
+(allow network-outbound (remote tcp "localhost:*"))
+(allow network-bind network-inbound (local tcp "localhost:*"))
 ```
 `test` gets the same profile with `src` replaced by `testsrc-N` and **no** network allow: `(deny network*)` only.
 No unix sockets are allowed at all. SBPL accepts only `*` or `localhost` as the host in `remote ip` (checked:
@@ -168,7 +171,7 @@ No unix sockets are allowed at all. SBPL accepts only `*` or `localhost` as the 
 ### Egress proxy
 
 The helper runs a `ThreadingHTTPServer` on `127.0.0.1` (ephemeral port) for the life of the worker, in the helper
-process (so outside the sandbox). The worker's `ANTHROPIC_BASE_URL` is that port, which is the only network allow.
+process (so outside the sandbox). The worker's `ANTHROPIC_BASE_URL` is that port, which is the only way the worker reaches the model by design; localhost in general is open (see Scratch dirs and loopback).
 
 - Forwards only `POST /v1/messages` and `POST /v1/messages/count_tokens` (query strings allowed) to the configured
   base URL, streaming the response in chunks so SSE works. Passes through the status and the `content-type`,
@@ -180,11 +183,36 @@ process (so outside the sandbox). The worker's `ANTHROPIC_BASE_URL` is that port
 **Residual risk:** the worker can still send extra `/v1/messages` calls through the proxy. That means more model calls
 billed to the Ollama account, but no data leaves that the worker couldn't already send.
 
-**Known limitation (xcrun noise):** `/usr/bin/python3` under the profile prints `couldn't create cache file
-'.../T/xcrun_db-XXXX'`. The `xcrun_db-` write allow does not stop it. Adding metadata read on `/private/var/folders`
-gets past the create but then the rename to `xcrun_db` is denied, so a fix needs write access to `xcrun_db` itself.
-That file is the unsandboxed `xcrun` shim's tool-lookup cache, so the worker could poison it. Left as is: the noise
-is harmless, the write allow is not.
+### Scratch dirs and loopback (user decisions 2026-10-29)
+
+Runs spent most turns fighting the sandbox (`mkdir /tmp` denied, zsh heredocs, xcodegen on `/var/folders/.../T`,
+git and `xcrun_db-`). Decisions:
+
+- **Temp dirs.** The worker may read and write `/private/tmp`, `DARWIN_USER_TEMP_DIR` (`<T>`) and
+  `DARWIN_USER_CACHE_DIR` (`<C>`), but only entries created during the run. At run start `snapshot_temp_entries`
+  lists the top-level entries of the three roots and the profile denies each one (read and write; `<T>` has ~8.7k,
+  so names go into capped regex alternations, shortened to name prefixes if the 64 KB profile limit needs it).
+  Always denied: Claude's own folders (`claude*`, `ccd-`, `com.anthropic.`), `.git`, `.claude`, `HEAD` (an implicit bare repo whose planted `core.fsmonitor` a host `git status` would run),
+  `CLAUDE.md` at any depth, `node_modules` directly under a root, and `<T>xcrun_db` (the unsandboxed xcrun shim's tool cache, which a
+  worker could poison). The three roots themselves are write-denied (`literal`): no `chmod` or inheritable ACE on
+  them, while creating and removing children still works. The old `xcrun_db-` write allow is gone. Accepted gap: an entry the host creates mid-run.
+- **Claude Code's own path check** stays `--permission-mode dontAsk`; `build_claude_argv` passes
+  `--add-dir` for the three roots. `check_init` still requires `dontAsk` and the exact tool list.
+- **Loopback is always on.** The worker may bind, listen and connect over TCP on any localhost port, so it can
+  reach every TCP service listening on the host's localhost (user decision 2026-10-29: tests need local servers,
+  and the sandbox cannot block single ports reliably). UDP, non-loopback addresses and unix sockets stay denied.
+  Measured on this macOS (Darwin 27): after `(allow ... "localhost:*")`, a `(deny ... "localhost:N")` is ignored for
+  about half of all ports, the same ports every time (18 of 30 leaked; the `ip`, `*:N`, `require-not` and
+  ordering variants fail too), so the profile carries no connect denies and promises none: **connecting** to host services is open.
+  **Binding** is different: a `(deny network-bind network-inbound (local tcp "localhost:P"))` after the wildcard allow
+  is enforced (30 of 30 refused, 30 of 30 succeeded without it). The profile emits it for the proxy port and every
+  port in the start snapshot, so the worker cannot take over a host listener's loopback clients (for example by
+  binding 127.0.0.1:P with `SO_REUSEADDR` while the host listens on 0.0.0.0:P). Because that makes the snapshot
+  security-relevant, **the run refuses to start if the `netstat -anv -p tcp` snapshot fails or finds no listeners.**
+  `run.json` records `host_listeners` (the snapshot, minus the proxy port) and, after the worker exits,
+  `worker_listeners` (new LISTEN ports not in that snapshot). A listener the host starts mid-run is not protected.
+- `ALLOW_LISTEN` gates the bind and inbound allows. SBPL cannot tell a loopback listen from a wildcard one, so a
+  worker listener could be reachable from the LAN; that is why `worker_listeners` is logged.
 
 ### Survivors
 
@@ -267,7 +295,7 @@ tools may read it; they must not write it. It is written atomically (temp file i
 
 The default is `http://localhost:11434`. Other hosts are read only from `~/.config/offload/config.json` (`base_urls`
 allowlist), never from env or repo files. A non-loopback host requires https. The proxy forwards to that base URL; the
-sandbox profile's only network allow is the proxy's loopback port, whatever the base URL is.
+sandbox allows localhost TCP whatever the base URL is; only the proxy filters what reaches Ollama.
 
 ## Delegating-Claude protocol (skill)
 
@@ -341,7 +369,7 @@ tests the brief asks for, run the tests, commit if you like, and finish with a s
 
 ### Registry proxy (read-only reverse proxy)
 
-The worker's network reach is unchanged: one allow, `localhost:<proxy port>`, and no DNS. The v0.3 draft used
+The worker's network reach as of v0.4: TCP on localhost (any port), no DNS, nothing off the machine. The v0.3 draft used
 CONNECT tunnels. The Opus review rejected that (F1, F2):
 - Every registry sits on Fastly or Cloudflare, so a tunnel to an allowed host can carry TLS for any site on that CDN.
 - `npm publish` is a PUT to the allowed npm host.
@@ -399,6 +427,9 @@ crates-index: the last segment; maven: the groupId/artifactId path without versi
 
 **Worker environment.** `P` = `http://127.0.0.1:<port>`.
 - pip: `PIP_INDEX_URL=P/r/pypi/simple` and `PIP_TRUSTED_HOST=127.0.0.1`. The helper writes no pip config.
+- uv ignores the `PIP_*` settings: `UV_DEFAULT_INDEX=P/r/pypi/simple` and `UV_INSECURE_HOST=127.0.0.1`. Checked
+  2026-10-29 with `uv pip install six` against a real proxy: resolved and installed, file download went through
+  `/r/pyfiles/`.
 - npm: `NPM_CONFIG_REGISTRY=P/r/npm/`. `npm_config_cache` goes in run `home`, which it already does.
 - cargo: `CARGO_HOME=<run>/home/.cargo` with a helper-written `config.toml`:
   `[source.crates-io] replace-with="offload"` and `[source.offload] registry="sparse+P/r/crates-index/"`.

@@ -52,7 +52,7 @@ One sentence: what done looks like.
 
 ## Context
 Exact file paths and symbols. Repo conventions copied from CLAUDE.md, because the worker sees no CLAUDE.md.
-There is no network except package registries (pypi, npm, crates, maven), which are on by default; other dependencies must be vendored in the repo or available through --allow-read.
+There is no network except package registries (pypi, npm, crates, maven), which are on by default; the worker can use `/private/tmp` for scratch files and can reach any TCP service on the host's localhost (user decision 2026-10-29); other dependencies must be vendored in the repo or available through --allow-read.
 
 ## Steps and scope
 What to build, in order.

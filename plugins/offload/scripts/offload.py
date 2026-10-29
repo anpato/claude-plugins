@@ -18,6 +18,7 @@ affects the base URL, which comes only from the default or ~/.config/offload/con
 Every subcommand prints JSON to stdout; `diff` prints the diff text and then a JSON trailer.
 """
 import argparse
+import getpass
 import hashlib
 import http.client
 import ipaddress
@@ -57,6 +58,9 @@ MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}$")
 ALLOWED_TOOLS = ("Bash", "Read", "Edit", "Write", "Glob", "Grep")
 DENIED_TOOLS = ("WebFetch", "WebSearch", "Agent", "Skill")
 LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
+# Whether the worker may bind and listen on loopback. SBPL cannot tell a loopback listen from a wildcard one,
+# so a worker listener can be reachable from the LAN; run.json records `worker_listeners` either way.
+ALLOW_LISTEN = True
 # USD per 1M tokens: (input, cache read, output)
 PRICES = {"kimi-k3:cloud": (3.0, 0.30, 15.0)}
 # --allow-read is an allowlist: paths under these (relative to $HOME) or under these repo subdirs.
@@ -332,12 +336,13 @@ def resolve_claude(allow_untested=False):
     return {"link": os.path.abspath(link), "real": real, "version": version}
 
 
-def build_claude_argv(claude_real, max_turns):
+def build_claude_argv(claude_real, max_turns, add_dirs=()):
+    dirs = [a for d in add_dirs for a in ("--add-dir", d)]  # Claude Code's own path check, same dirs as the profile
     return [claude_real, "-p", "--bare", "--strict-mcp-config", "--setting-sources", "",
             "--no-session-persistence", "--output-format", "stream-json", "--verbose",
             "--max-turns", str(int(max_turns)), "--permission-mode", "dontAsk", "--permission-prompts", "none",
             "--tools", ",".join(ALLOWED_TOOLS), "--allowedTools", ",".join(ALLOWED_TOOLS),
-            "--disallowedTools", ",".join(DENIED_TOOLS), "--disable-slash-commands"]
+            "--disallowedTools", ",".join(DENIED_TOOLS), "--disable-slash-commands", *dirs]
 
 
 def clt_bin_dir():
@@ -386,11 +391,14 @@ def build_worker_env(run_dir, model, base_url, max_thinking=DEFAULT_MAX_THINKING
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
         "MAX_THINKING_TOKENS": str(int(max_thinking)),
         "CARGO_HOME": os.path.join(run_dir, "home", ".cargo"),
+        "USER": getpass.getuser(), "LOGNAME": getpass.getuser(),  # xcodegen and others refuse to run without one
+        "UV_PYTHON_DOWNLOADS": "never",  # python builds come from github, which the proxy does not serve
         "GOPROXY": "off", "GOFLAGS": "-mod=mod", "GOSUMDB": "off", "GOCACHE": os.path.join(tmp, "gocache"),
     }
     # package registries, through the proxy's read-only routes, only for the ones enabled for this run
     if "pypi" in registries:
-        env.update(PIP_INDEX_URL=f"{base_url}/r/pypi/simple", PIP_TRUSTED_HOST="127.0.0.1")
+        env.update(PIP_INDEX_URL=f"{base_url}/r/pypi/simple", PIP_TRUSTED_HOST="127.0.0.1",
+                   UV_DEFAULT_INDEX=f"{base_url}/r/pypi/simple", UV_INSECURE_HOST="127.0.0.1")  # uv ignores the PIP_* ones
     if "npm" in registries:
         env["NPM_CONFIG_REGISTRY"] = f"{base_url}/r/npm/"
     mod = go_modcache(allow_read)
@@ -451,13 +459,158 @@ def _ancestors(path):
     return out
 
 
-def user_temp_dir():
+def _darwin_dir(name):
     try:
-        p = subprocess.run(["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"], capture_output=True, text=True, shell=False)
+        p = subprocess.run(["/usr/bin/getconf", name], capture_output=True, text=True, shell=False)
         d = p.stdout.strip()
         return os.path.realpath(d).rstrip("/") + "/" if p.returncode == 0 and d else None
     except OSError:
         return None
+
+
+def user_temp_dir():
+    return _darwin_dir("DARWIN_USER_TEMP_DIR")
+
+
+def user_cache_dir():
+    return _darwin_dir("DARWIN_USER_CACHE_DIR")
+
+
+def temp_roots(temp_dir="auto", cache_dir="auto"):
+    """The scratch dirs the worker may use: /private/tmp and the user's temp and cache dirs (no trailing /)."""
+    t = user_temp_dir() if temp_dir == "auto" else temp_dir
+    c = user_cache_dir() if cache_dir == "auto" else cache_dir
+    return ["/private/tmp"] + [d.rstrip("/") for d in (t, c) if d]
+
+
+def snapshot_temp_entries(roots):
+    """Top-level entry names of each root, taken at run start. The worker gets none of these (only what it creates)."""
+    out = {}
+    for r in roots:
+        try:
+            out[r] = sorted(os.listdir(r))
+        except OSError as e:
+            raise OffloadError(f"cannot list {r} for the sandbox snapshot: {e}")
+    return out
+
+
+def parse_netstat_listeners(text):
+    """TCP LISTEN ports from `netstat -anv -p tcp` text: `127.0.0.1.4410`, `::1.18080`, `*.80` (tcp4/tcp6/tcp46)."""
+    ports = set()
+    for ln in text.splitlines():
+        f = ln.split()
+        if len(f) > 5 and f[0].startswith("tcp") and f[5] == "LISTEN":
+            tail = f[3].rsplit(".", 1)[-1]
+            if tail.isdigit():
+                ports.add(int(tail))
+    return ports
+
+
+def snapshot_listen_ports():
+    """Every TCP listener on the host (any owner, no root needed). Fails closed: an empty snapshot is an error."""
+    try:
+        p = subprocess.run(["/usr/sbin/netstat", "-anv", "-p", "tcp"], capture_output=True, text=True, shell=False,
+                           timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise OffloadError(f"cannot snapshot host listeners (netstat failed: {e})")
+    ports = parse_netstat_listeners(p.stdout) if p.returncode == 0 else set()
+    if not ports:
+        raise OffloadError("cannot snapshot host listeners (netstat failed or found none)")
+    return ports
+
+
+def _re_text(text):
+    """text as an ERE fragment. A character that cannot go in an SBPL regex string becomes [^/]*, which only
+    over-matches (denies more)."""
+    out = []
+    for c in text:
+        if not (c.isascii() and c.isprintable()) or c in '"\\':
+            out.append("[^/]*")
+        else:
+            out.append(c if c.isalnum() or c in "_-/" else "\\" + c)
+    return "".join(out)
+
+
+REGEX_BUDGET = 900  # sandbox-exec rejects a regex string over 1024 characters (measured: 1019 fails, 999 works)
+# sandbox-exec also caps the whole compiled profile (65535 bytes: "data object length ... exceeds maximum").
+# Measured on this Mac, the cap is hit at ~55k trie nodes of deny patterns (about 1000 UUID-style names), and the
+# <T> dir alone has ~8.7k entries. So the snapshot is shortened to name prefixes until it fits this budget.
+TRIE_NODE_BUDGET = 38000
+PREFIX_LADDER = (None, 24, 16, 12, 10, 8, 6, 5)  # longest first; the shortest still keeps 5 chars of every name
+
+
+def _trie_nodes(items):
+    """Characters in the prefix trie of items: the size proxy for the compiled regex."""
+    n, prev = 0, ""
+    for it in sorted(set(items)):
+        c = 0
+        while c < min(len(it), len(prev)) and it[c] == prev[c]:
+            c += 1
+        n += len(it) - c
+        prev = it
+    return n
+
+
+def shorten_entries(entries, budget=TRIE_NODE_BUDGET):
+    """Fit the snapshot under the node budget. Returns ({root: [(prefix, exact)]}, prefix length used). A name longer
+    than the cut becomes a prefix pattern (exact False), which only over-denies. Raises if even the shortest does not fit."""
+    for L in PREFIX_LADDER:
+        out = {r: sorted({(n, True) if L is None or len(n) <= L else (n[:L], False) for n in names})
+               for r, names in entries.items()}
+        if sum(_trie_nodes(p for p, _ in v) for v in out.values()) <= budget:
+            return out, L
+    raise OffloadError("the scratch-dir snapshot is too large for a sandbox profile even as 5-character prefixes")
+
+
+def entry_deny_rules(root, items, budget=REGEX_BUDGET):
+    """SBPL rules denying each existing entry of root, and everything below it, as size-capped regex alternations.
+    items are (name, exact) pairs; a non-exact name is a prefix."""
+    head, tail = f'(deny file-read* file-write* (regex #"^{_re_text(root)}/(', ')(/|$)"))'
+    rules, cur, size = [], [], 0
+    for name, exact in items:
+        frag = _re_text(name) + ("" if exact else "[^/]*")
+        if cur and size + len(frag) + 1 > budget - len(head):
+            rules.append(head + "|".join(cur) + tail)
+            cur, size = [], 0
+        cur.append(frag)
+        size += len(frag) + 1
+    if cur:
+        rules.append(head + "|".join(cur) + tail)
+    return rules
+
+
+def temp_rules(roots, entries, temp_dir, cache_dir, keep=None):
+    """The scratch-dir rules, last in the profile so they win: allow the roots, deny what existed at run start,
+    then the always-denied names (Claude's own files, planted-config names, xcrun's cache db)."""
+    rs = [sbpl_str(r) for r in roots]
+    alt = "|".join(_re_text(r) for r in roots)
+    rules = ["(allow file-read* file-write* " + " ".join(f"(subpath {r})" for r in rs) + ")"]
+    shortened, _ = shorten_entries({r: entries.get(r, []) for r in roots})
+    for r in roots:
+        rules += entry_deny_rules(r, shortened[r])
+    claude_names = [("/private/tmp/", ["claude"])]
+    if temp_dir:
+        claude_names.append((temp_dir.rstrip("/") + "/", ["claude", "ccd-", "com.anthropic."]))
+    if cache_dir:
+        claude_names.append((cache_dir.rstrip("/") + "/", ["claude", "com.anthropic."]))
+    rules.append("(deny file-read* file-write* " + " ".join(
+        f'(regex #"^{_re_text(base + n)}")' for base, ns in claude_names for n in ns) + ")")
+    rules.append(f'(deny file-write* (regex #"^({alt})(/.*)?/(\\.git|\\.claude|CLAUDE(\\.local)?\\.md|HEAD)(/|$)") '
+                 f'(regex #"^({alt})/node_modules(/|$)"))')
+    # `subpath` includes the root itself: without this the worker could chmod it or add an inheritable ACE.
+    rules.append("(deny file-write* " + " ".join(f"(literal {r})" for r in rs) + ")")
+    if temp_dir:
+        rules.append(f'(deny file-read* file-write* (literal {sbpl_str(temp_dir.rstrip("/") + "/xcrun_db")}))')
+    # The run's own paths win over the snapshot if they sit under a root (only when --home points there, as in tests).
+    under = lambda ps: [p for p in ps if any(p == r or p.startswith(r + "/") for r in roots)]
+    k = keep or {}
+    keep_rules = []
+    for verb, ps in (("file-read-metadata", under(k.get("meta", []))), ("file-read*", under(k.get("read", []))),
+                     ("file-write*", under(k.get("write", [])))):
+        if ps:
+            keep_rules.append(f"(allow {verb} " + " ".join(f"(subpath {sbpl_str(x)})" if verb != "file-read-metadata"
+                                                       else f"(literal {sbpl_str(x)})" for x in ps) + ")")
+    return rules + keep_rules
 
 
 def allow_read_roots(home, repo_root=None):
@@ -499,10 +652,16 @@ def default_read_roots(home=None, repo_root=None):
 
 
 def generate_profile(run_dir, claude_real, claude_link=None, allow_read=(), repo_root=None,
-                     home=None, temp_dir="auto", proxy_port=None, src_dir=None):
+                     home=None, temp_dir="auto", cache_dir="auto", proxy_port=None, src_dir=None,
+                     temp_entries=None, host_ports=()):
     """Build the SBPL text. Later rules win, so narrower allows follow the broad denies.
 
-    The only network allow is the loopback egress proxy (proxy_port); with none, all network is denied.
+    With no proxy_port all network is denied. With one, the worker may bind, listen and connect over TCP on any
+    loopback port (user decision 2026-10-29; sandbox-exec cannot block single ports: 18 of 30 denies leaked).
+    host_ports (listeners at run start) and the proxy port cannot be bound by the worker: a bind deny after the
+    wildcard allow is enforced (30 of 30), unlike a connect deny. This stops a SO_REUSEADDR takeover of a host
+    wildcard listener's loopback clients. temp_entries ({root: names}) are the scratch-dir entries that existed at run start: the worker gets
+    none of them. Both snapshots are inputs so this stays pure.
     src_dir is the writable code dir (RUN/src for the worker, RUN/testsrc-N for `test`)."""
     home = home or real_home()
     run_dir = os.path.realpath(run_dir)
@@ -522,12 +681,15 @@ def generate_profile(run_dir, claude_real, claude_link=None, allow_read=(), repo
 
     if temp_dir == "auto":
         temp_dir = user_temp_dir()
+    if cache_dir == "auto":
+        cache_dir = user_cache_dir()
+    roots = temp_roots(temp_dir, cache_dir)
+    for r in roots:
+        for a in _ancestors(r):
+            if a not in meta:
+                meta.append(a)
     writes = [f"(subpath {sbpl_str(p)})" for p in sub_reads[:4]]
     writes += ['(literal "/dev/null")', '(literal "/dev/tty")', '(regex #"^/dev/fd/")', '(regex #"^/dev/ttys")']
-    if temp_dir:
-        # Known limitation: this does not stop the xcrun cache noise (see DESIGN.md).
-        writes.append('(regex #"^' + re.sub(r"([^A-Za-z0-9_/])", r"\\\1", temp_dir) + 'xcrun_db-")')
-        sbpl_str(temp_dir)  # reject unsafe characters
 
     lines = [
         "(version 1)",
@@ -555,9 +717,18 @@ def generate_profile(run_dir, claude_real, claude_link=None, allow_read=(), repo
         "(deny appleevent-send)",
         "(deny network*)",
     ]
+    lines += temp_rules(roots, temp_entries or {}, temp_dir, cache_dir,
+                        {"meta": meta, "read": sub_reads + literal_reads, "write": sub_reads[:4]})
     if proxy_port:
-        # SBPL accepts only "*" or "localhost" as the host here; 127.0.0.1 is rejected by sandbox-exec.
-        lines.append(f'(allow network-outbound (remote ip "localhost:{int(proxy_port)}"))')
+        # SBPL accepts only "*" or "localhost" as the host, and one port (no ranges); 127.0.0.1 is rejected.
+        # TCP only: UDP stays denied. Unix sockets stay denied.
+        proxy = int(proxy_port)
+        lines.append('(allow network-outbound (remote tcp "localhost:*"))')
+        if ALLOW_LISTEN:
+            lines.append('(allow network-bind network-inbound (local tcp "localhost:*"))')
+            taken = sorted({int(p) for p in host_ports} | {proxy})
+            lines.append("(deny network-bind network-inbound " + " ".join(f'(local tcp "localhost:{p}")' for p in taken) + ")")
+        lines.append(f'(allow network-outbound (remote tcp "localhost:{proxy}"))')  # redundant, kept so the order is clear
     return "\n".join(lines) + "\n"
 
 
@@ -1139,9 +1310,13 @@ def check_branch_free(repo, slug, home):
 
 def write_profile(ctx, proxy_port=None, src_dir=None, path=None):
     claude = ctx.get("claude")
+    # Scratch-dir entries at run start (kept in ctx so a rewrite of the profile keeps the same snapshot).
+    if "temp_entries" not in ctx:
+        ctx["temp_entries"] = snapshot_temp_entries(temp_roots())
     text = generate_profile(ctx["run_dir"], claude["real"] if claude else "/usr/bin/true",
                             claude["link"] if claude else None, ctx.get("allow_read", ()),
-                            repo_root=ctx["repo"], proxy_port=proxy_port, src_dir=src_dir)
+                            repo_root=ctx["repo"], proxy_port=proxy_port, src_dir=src_dir,
+                            temp_entries=ctx["temp_entries"], host_ports=ctx.get("host_ports") or ())
     with open(path or ctx["profile"], "w") as f:
         f.write(text)
 
@@ -1250,6 +1425,85 @@ def _probe_conn_limit(port, limit=PROXY_MAX_CONNS):
             c.close()
 
 
+# Run inside the sandbox: one JSON object of network probe outcomes (True means the operation succeeded).
+_NET_PROBE = r"""
+import json, socket, sys
+proxy = int(sys.argv[1])
+taken = [int(a) for a in sys.argv[2:]]
+r = {}
+def tcp(port, timeout=2):
+    c = socket.socket(); c.settimeout(timeout); c.connect(("127.0.0.1", port)); c.close()
+def attempt(name, f):
+    try:
+        f(); r[name] = True
+    except Exception:
+        r[name] = False
+def own():
+    s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen(); tcp(s.getsockname()[1]); s.close()
+def udp():
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.sendto(b"x", ("127.0.0.1", 9))
+def take(port):
+    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", port)); s.listen()
+for t in [proxy] + taken:
+    attempt("take%d" % t, lambda: take(t))
+attempt("listen_connect", own)
+attempt("udp", udp)
+attempt("proxy", lambda: tcp(proxy))
+print(json.dumps(r))
+"""
+
+
+def selftest_scratch(ctx, sb, record, fresh, denied, env):
+    """The probes for the scratch dirs and loopback (design R6)."""
+    entries = ctx.get("temp_entries") or {}
+    tmp = "/private/tmp"
+    p = fresh(tmp, "offload-probe")
+    q = sb(["/bin/sh", "-c", f'echo ok > "{p}" && cat "{p}"'])
+    leftover = os.path.lexists(p)
+    if leftover:
+        os.remove(p)
+    record("write+read a new file in /private/tmp succeeds", q.returncode == 0 and q.stdout.strip() == "ok",
+           q.stderr.strip())
+    old = next((n for n in entries.get(tmp, []) if not n.startswith("claude") and os.path.lexists(f"{tmp}/{n}")), None)
+    if old:
+        q = sb(["/bin/ls", "-d", f"{tmp}/{old}"])
+        record("existing /private/tmp entry is denied", denied(q) and not q.stdout, q.stderr.strip())
+    else:
+        record("existing /private/tmp entry is denied (none exists, skipped)", True)
+    git = f"{tmp}/.git"
+    pre = os.path.lexists(git)
+    q = sb(["/bin/mkdir", "-p", f"{git}/x"])
+    if not pre and os.path.lexists(git):
+        shutil.rmtree(git, ignore_errors=True)
+    record("write /private/tmp/.git/x is denied", denied(q) and not (os.path.lexists(git) and not pre), q.stderr.strip())
+    if user_temp_dir():
+        xc = user_temp_dir() + "xcrun_db"
+        q = sb(["/bin/cat", xc])
+        record("read of <T>xcrun_db is denied", denied(q), q.stderr.strip())
+        q = sb(["/usr/bin/touch", xc])
+        record("write of <T>xcrun_db is denied", denied(q), q.stderr.strip())
+    py = shutil.which("python3", path=env["PATH"])
+    if not (py and ctx.get("proxy_port")):
+        record("loopback probes (no python3 or no proxy, skipped)", True)
+        return
+    hosts = [p for p in ctx.get("host_ports") or [] if p != ctx["proxy_port"] and p > 1023][:3]
+    q = sb([py, "-c", _NET_PROBE, str(ctx["proxy_port"]), *map(str, hosts)], timeout=30)
+    try:
+        r = json.loads(q.stdout)
+    except ValueError:
+        record("loopback probes ran", False, (q.stderr or q.stdout).strip())
+        return
+    record("bind+listen+connect on a fresh localhost port works", r["listen_connect"] == ALLOW_LISTEN)
+    record("UDP send to localhost is denied", r["udp"] is False)
+    record("the proxy port is reachable", r["proxy"] is True)
+    record("binding the proxy port is denied", r["take%d" % ctx["proxy_port"]] is False)
+    if hosts:
+        record("binding a snapshotted host port is denied", all(r["take%d" % h] is False for h in hosts),
+               f"ports {hosts}")
+    else:
+        record("binding a snapshotted host port is denied (none above 1023, skipped)", True)
+
+
 def run_selftest(ctx, online=None):
     """Deterministic sandbox checks, no model. Returns (ok, results).
 
@@ -1298,9 +1552,6 @@ def run_selftest(ctx, online=None):
     if os.path.exists(curl):
         p = sb([curl, "-m", "3", "-sS", "https://example.com"], timeout=15)
         record("network to example.com fails", p.returncode != 0 and not p.stdout, p.stderr.strip())
-        p = sb([curl, "-m", "2", "-s", "-o", "/dev/null", "-w", "%{http_code}", "http://127.0.0.1:11434/api/tags"])
-        record("direct connect to localhost:11434 fails", p.returncode != 0 and p.stdout.strip() in ("", "000"),
-               f"exit {p.returncode}")
         if os.path.exists("/var/run/docker.sock"):
             p = sb([curl, "-s", "-v", "-m", "2", "--unix-socket", "/var/run/docker.sock", "http://d/_ping"])
             record("unix socket connect (docker.sock) fails", p.returncode == 7 or "Connected" not in p.stderr,
@@ -1350,6 +1601,7 @@ def run_selftest(ctx, online=None):
         p = sb(["/usr/bin/dscacheutil", "-q", "host", "-a", "name", "example.com"])
         record("DNS lookup of example.com fails", "ip_address" not in p.stdout and "ipv6_address" not in p.stdout,
                f"exit {p.returncode}")
+    selftest_scratch(ctx, sb, record, fresh, denied, env)
     sprobe = fresh(ctx["src"], ".probe")
     p = sb(["/usr/bin/touch", sprobe])
     ok = p.returncode == 0 and os.path.exists(sprobe)
@@ -1506,7 +1758,7 @@ def launch_worker(ctx, brief_text, timeout_s):
     """Step 5/6: run the worker, reading stream-json incrementally. Returns an outcome dict."""
     env = build_worker_env(ctx["run_dir"], ctx["model"], worker_url(ctx), ctx["max_thinking"],
                            allow_read=ctx.get("allow_read", ()), registries=ctx.get("registries", ()))
-    argv = sandbox_argv(ctx["profile"], build_claude_argv(ctx["claude"]["real"], ctx["max_turns"]))
+    argv = sandbox_argv(ctx["profile"], build_claude_argv(ctx["claude"]["real"], ctx["max_turns"], temp_roots()))
     preamble = WORKER_PREAMBLE
     log_path = os.path.join(ctx["run_dir"], "worker.jsonl")
     out = {"init_problems": [], "saw_init": False, "timed_out": False, "result": None, "usage": {},
@@ -1575,6 +1827,14 @@ def launch_worker(ctx, brief_text, timeout_s):
             if buf[0] and not out["init_problems"]:
                 handle_line(buf[0])
         finally:
+            # Listeners the worker left (or its survivors still hold), before the sweep kills them.
+            try:
+                start = ctx.get("listeners_at_start")
+                if start is None:
+                    raise OffloadError("no start snapshot")
+                ctx["record"]["worker_listeners"] = sorted(snapshot_listen_ports() - start - {ctx.get("proxy_port")})
+            except OffloadError:
+                ctx["record"]["worker_listeners"] = None
             out["survivors_killed"] = sweep_survivors(proc, ctx["run_dir"])
             try:
                 proc.stdout.close()
@@ -1696,6 +1956,12 @@ def cmd_run(args, ohome):
                            registries=ctx["registries"])
         try:
             ctx["proxy_port"] = proxy.start()
+            # Host listeners now, proxy included. The worker may not bind these ports (a takeover would receive the
+            # host's loopback clients), so this is security-relevant: fail closed if netstat fails or finds none.
+            ctx["listeners_at_start"] = snapshot_listen_ports()
+            ctx["host_ports"] = sorted(ctx["listeners_at_start"])
+            rec["host_listeners"] = sorted(ctx["listeners_at_start"] - {ctx["proxy_port"]})
+            write_run_json(ctx["run_dir"], rec)
             write_profile(ctx, ctx["proxy_port"])
             write_registry_configs(ctx["run_dir"], worker_url(ctx), ctx["registries"])
             ok, checks = run_selftest(ctx)
