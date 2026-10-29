@@ -506,16 +506,33 @@ def parse_netstat_listeners(text):
     return ports
 
 
-def snapshot_listen_ports():
-    """Every TCP listener on the host (any owner, no root needed). Fails closed: an empty snapshot is an error."""
+def parse_lsof_listeners(text):
+    """TCP LISTEN ports from `lsof -nP -iTCP -sTCP:LISTEN -Fn` text: `n*:53643`, `n127.0.0.1:4410`, `n[::1]:18080`."""
+    ports = set()
+    for ln in text.splitlines():
+        tail = ln.rsplit(":", 1)[-1] if ln.startswith("n") else ""
+        if tail.isdigit():
+            ports.add(int(tail))
+    return ports
+
+
+def _listeners(argv, parse):
     try:
-        p = subprocess.run(["/usr/sbin/netstat", "-anv", "-p", "tcp"], capture_output=True, text=True, shell=False,
-                           timeout=30)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        raise OffloadError(f"cannot snapshot host listeners (netstat failed: {e})")
-    ports = parse_netstat_listeners(p.stdout) if p.returncode == 0 else set()
+        p = subprocess.run(argv, capture_output=True, text=True, shell=False, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    return parse(p.stdout) if p.returncode == 0 else set()
+
+
+def snapshot_listen_ports():
+    """Every TCP listener on the host (any owner, no root needed). Fails closed: an empty snapshot is an error.
+    Under a non-Apple python (Homebrew, uv) the kernel hides every socket from netstat, so fall back to lsof,
+    which still sees this user's listeners but not root's (e.g. launchd's 8021): those are left unprotected."""
+    ports = _listeners(["/usr/sbin/netstat", "-anv", "-p", "tcp"], parse_netstat_listeners)
     if not ports:
-        raise OffloadError("cannot snapshot host listeners (netstat failed or found none)")
+        ports = _listeners(["/usr/sbin/lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fn"], parse_lsof_listeners)
+    if not ports:
+        raise OffloadError("cannot snapshot host listeners (netstat and lsof failed or found none)")
     return ports
 
 
