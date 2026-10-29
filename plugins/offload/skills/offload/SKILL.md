@@ -70,6 +70,16 @@ No secrets and no personal content: the worker's model calls leave the machine. 
 
 Run `offload.py run` in the background. Run at most 3 at once. The `run *` pre-approval also matches `--allow-read` (a pattern can't exclude one flag), so the rule lives here: **ask the user to confirm before passing any `--allow-read`.** The helper accepts only an allowlist of toolchain caches (`~/go/pkg/mod`, `~/.cargo/registry`, `~/.cargo/git`, `~/.rustup`, `~/.m2/repository`, `~/.gradle/caches`, `~/.npm/_cacache`, and the repo's `node_modules`, `vendor`, `.venv`) and refuses everything else.
 
+**Size `--max-turns` (and `--timeout-min`) to the brief's scope.** The default of 60 fits only a small task. A run that hits the cap fails and the spend is lost, so set it from the scope:
+
+| Scope | `--max-turns` | `--timeout-min` |
+|---|---|---|
+| One function or fix plus tests | 60 (default) | 45 (default) |
+| One feature slice: a few files, one layer | 150 | 45 |
+| A whole feature: several layers, or a new module | 400 | 60 |
+
+Past runs as reference: a small helper took 21 turns, a feature slice took 86, and full features took 231–352 turns and 16–18 min. A turn costs about $0.03–0.045. Before launching, tell the user the cap and the worst-case cost (cap × $0.045). For work bigger than the last row, split the brief rather than raising the cap further.
+
 Registries are on by default. Pass `--registries` (comma-separated from pypi, npm, crates, maven) to narrow them, or `--registries none` to turn them off.
 
 If `status` is `sandbox_selftest_failed`, `init_check_failed`, `ref_violation` or `error`, stop and report it to the user. Do not retry or work around it.
