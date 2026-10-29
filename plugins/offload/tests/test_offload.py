@@ -1635,10 +1635,11 @@ def test_cmd_run_records_session_id(tmp_path, repo, monkeypatch, capsys):
     assert rec["session_id"] == "sess-123"
 
 
-# ------------------------------------------------------------------ registries are off by default (user decision 2026-10-27)
+# ------------------------------------------------------------------ registries are on by default (user decision 2026-10-29)
 
 def test_parse_registries():
     assert offload.parse_registries("") == [] and offload.parse_registries(None) == []
+    assert offload.parse_registries("none") == [] and offload.parse_registries(" none ") == []
     assert offload.parse_registries("maven, pypi,pypi") == ["pypi", "maven"]
     for bad in ("pip", "pypi,go", ","):
         with pytest.raises(offload.OffloadError):
@@ -1706,7 +1707,10 @@ def test_cmd_run_registries_flag_recorded_and_unknown_rejected(tmp_path, repo, m
                 "text": "", "returncode": 0, "turns": 1, "survivors_killed": []}
     monkeypatch.setattr(offload, "launch_worker", fake_launch)
     base = ["--home", ohome, "run", "--repo", str(repo), "--brief", str(brief)]
-    assert offload.main(base + ["--slug", "off"]) == 0
+    assert offload.main(base + ["--slug", "default"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["registries"] == ["pypi", "npm", "crates", "maven"] and seen["m2"] is True and seen["cargo"] is True
+    assert offload.main(base + ["--slug", "off", "--registries", "none"]) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["registries"] == [] and seen["m2"] is False and seen["cargo"] is False
     rec = json.loads((Path(ohome) / "runs" / out["run_id"] / "run.json").read_text())

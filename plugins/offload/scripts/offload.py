@@ -77,7 +77,7 @@ REGISTRY_ROUTES = {
     "/r/crates-static/": "https://static.crates.io/",
     "/r/maven/": "https://repo.maven.apache.org/maven2/",
 }
-# `run --registries` names -> routes served (user decision 2026-10-27: off by default, enabled per run)
+# `run --registries` names -> routes served (user decision 2026-10-29: all on by default; `none` turns them off)
 REGISTRY_GROUPS = {
     "pypi": ("/r/pypi/", "/r/pyfiles/"),
     "npm": ("/r/npm/",),
@@ -87,7 +87,9 @@ REGISTRY_GROUPS = {
 
 
 def parse_registries(value):
-    """'pypi,npm' -> ['npm', 'pypi'] (canonical order); an unknown name is an error before any spend."""
+    """'pypi,npm' -> ['npm', 'pypi'] (canonical order), 'none' -> []; an unknown name is an error before any spend."""
+    if (value or "").strip() == "none":
+        return []
     names = [n.strip() for n in (value or "").split(",") if n.strip()]
     bad = [n for n in names if n not in REGISTRY_GROUPS]
     if bad or (value and not names):
@@ -1920,7 +1922,7 @@ def build_parser():
     r.add_argument("--max-thinking-tokens", type=int, default=DEFAULT_MAX_THINKING)
     r.add_argument("--allow-read", action="append", default=[])
     r.add_argument("--base-url")
-    r.add_argument("--registries", default="", metavar="LIST")
+    r.add_argument("--registries", default=",".join(REGISTRY_GROUPS), metavar="LIST")
     r.add_argument("--allow-untested-claude", action="store_true")
     t = sub.add_parser("test")
     t.add_argument("--run", required=True)

@@ -324,9 +324,9 @@ tests the brief asks for, run the tests, commit if you like, and finish with a s
 
 - **Web tools stay off.** `DENIED_TOOLS` is unchanged. Docs the worker needs go in the brief.
 - **`DEFAULT_MAX_TURNS` goes from 40 to 60.**
-- **Registry routes are off by default and enabled per run** (user decision 2026-10-27). `run --registries LIST` takes
+- **Registry routes are on by default** (user decision 2026-10-29, replacing off-by-default from 2026-10-27). `run --registries LIST` takes
   names from {pypi, npm, crates, maven}; pypi enables `/r/pypi/` and `/r/pyfiles/`, crates enables `/r/crates-index/`
-  and `/r/crates-static/`. An unknown name is an error before any spend. The list is recorded as `registries` in
+  and `/r/crates-static/`. `--registries none` serves no route. An unknown name is an error before any spend. The list is recorded as `registries` in
   run.json and the output JSON.
 - **Toolchain caches are readable by default, limited to public content** (narrowed after the Opus review, F3).
   The default roots are `DEFAULT_READ_HOME = (".rustup",)`: toolchains only. `~/.cargo/registry` is not a default (fix pass): it can
@@ -349,7 +349,7 @@ CONNECT tunnels. The Opus review rejected that (F1, F2):
 There is no CONNECT and no `HTTPS_PROXY`. The helper makes every outbound TLS connection itself, so it sees and
 filters the HTTP.
 
-**Off by default (user decision 2026-10-27: off by default, `--registries` per run).** With no flag no `/r/` route is
+**On by default (user decision 2026-10-29; it was off by default from 2026-10-27).** With `--registries none` no `/r/` route is
 served: every `/r/` request gets 403 and is logged to `proxy_rejects.log`. The worker env sets `PIP_*` only for pypi
 and `NPM_CONFIG_REGISTRY` only for npm. The helper writes cargo `config.toml` only for crates and maven
 `settings.xml` only for maven. The self-test's 403 probes always run, and it adds one: with pypi disabled,
