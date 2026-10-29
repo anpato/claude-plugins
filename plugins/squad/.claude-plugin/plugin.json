@@ -1,7 +1,7 @@
 {
   "name": "squad",
   "description": "A live panel of this session's subagents as tiny vehicles: what each is doing, its model, effort, steps, context, tokens and time, with an activity bar and a one-line band above the prompt. /squad opens it.",
-  "version": "1.1.3",
+  "version": "1.1.4",
   "author": {
     "name": "apato"
   },

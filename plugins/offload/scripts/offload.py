@@ -1193,7 +1193,9 @@ def prepare_run(repo, slug, ohome, model=DEFAULT_MODEL, base=None, claude=None, 
                      "branch": f"offload/{slug}", "base_sha": ctx["base_sha"], "base_url": base["url"],
                      "status": "prepared", "created": time.time(), "max_turns": max_turns,
                      "claude": claude, "allow_read": allow, "warnings": warnings,
-                     "registries": list(registries)}
+                     "registries": list(registries),
+                     # The Claude Code session that started the run, so squad shows it only there.
+                     "session_id": os.environ.get("CLAUDE_CODE_SESSION_ID")}
     write_run_json(run_dir, ctx["record"])
     return ctx
 

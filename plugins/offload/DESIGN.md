@@ -43,7 +43,7 @@ It must not be able to:
   home/       fake HOME
   config/     CLAUDE_CONFIG_DIR (empty)
   profile.sb  generated sandbox-exec profile
-  run.json    run record: repo root, base sha, slug, model, status, timings, usage
+  run.json    run record: repo root, base sha, slug, model, status, timings, usage, the starting Claude Code session
   worker.jsonl  raw stream-json from the worker
 ```
 
