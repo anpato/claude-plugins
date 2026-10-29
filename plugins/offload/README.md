@@ -36,8 +36,8 @@ Other base URLs are read only from `~/.config/offload/config.json` (`{"base_urls
 
 The worker model and all it writes are untrusted.
 
-- The worker runs under `sandbox-exec` in a per-run directory. It cannot read your home, other projects, `~/.claude*`, credentials, or the run's own git repo, and it can write only inside the run directory.
-- The worker can reach one loopback port only: a filtering proxy in the helper that forwards just `POST /v1/messages` and `/v1/messages/count_tokens` to Ollama. Other Ollama endpoints (pull, delete, tags), unix sockets, the clipboard, DNS and AppleEvents are blocked. There are no MCP servers, no web tools and no subagents; the helper checks the worker's `init` event and kills it on any mismatch.
+- The worker runs under `sandbox-exec` in a per-run directory. It cannot read your home, other projects, `~/.claude*`, credentials, or the run's own git repo, and it can write only inside the run directory and scratch files it creates in `/private/tmp` and your user temp and cache dirs (entries that existed at run start stay off limits).
+- The worker can bind and connect over TCP on localhost, so it can reach every TCP service listening on your machine's localhost (including Ollama's own API); the sandbox cannot block connects to single ports reliably, and local test servers need it. It cannot bind a port the host was already listening on at run start (the run refuses to start if that port list cannot be read). The proxy still forwards just `POST /v1/messages` and `/v1/messages/count_tokens` for the model. Non-loopback network, UDP, unix sockets, the clipboard, DNS and AppleEvents are blocked. There are no MCP servers, no web tools and no subagents; the helper checks the worker's `init` event and kills it on any mismatch.
 - The worker never touches your repo. A helper-owned bare clone holds its commit, which is fetched into your repo as one new branch. Every other ref is compared around the fetch.
 - Every git command runs through one wrapper that disables hooks, global config, fsmonitor and attribute files.
 - Text coming back is truncated and stripped of control characters, and the skill tells Claude to treat it as data.
@@ -45,7 +45,7 @@ The worker model and all it writes are untrusted.
 ## What the worker can do
 
 - Work like Claude in a repo: `git` (local, no remote), `python3`, temp files (`mktemp -d "$TMPDIR/x.XXXXXX"`) and zsh heredocs all work in the sandbox. The Command Line Tools come first on its PATH.
-- Install dependencies from pypi, npm, crates.io and maven through the same loopback port, only for the registries you enable per run with `--registries pypi,npm,crates,maven` (off by default). The proxy serves read-only `GET`/`HEAD` on six fixed routes (`/r/pypi/`, `/r/pyfiles/`, `/r/npm/`, `/r/crates-index/`, `/r/crates-static/`, `/r/maven/`), rebuilds the headers, blocks private addresses and does not follow redirects. There is no CONNECT and no `HTTPS_PROXY`. Go modules are not fetched: use `--allow-read ~/go/pkg/mod`.
+- Install dependencies from pypi, npm, crates.io and maven through the same loopback port, all four on by default; narrow them with `--registries pypi,npm` or turn them off with `--registries none`. The proxy serves read-only `GET`/`HEAD` on six fixed routes (`/r/pypi/`, `/r/pyfiles/`, `/r/npm/`, `/r/crates-index/`, `/r/crates-static/`, `/r/maven/`), rebuilds the headers, blocks private addresses and does not follow redirects. There is no CONNECT and no `HTTPS_PROXY`. Go modules are not fetched: use `--allow-read ~/go/pkg/mod`.
 - Read `~/.rustup` by default when it exists (public content only). Every registry request is logged to `<run>/registry_requests.log` and summarised as `registry_requests` in the run output.
 - Take up to 60 turns by default (`--max-turns`).
 - Dependency files it changes (`requirements.txt`, `Cargo.toml`, `go.mod`, `pom.xml`, `*.gradle`) are flagged for review.

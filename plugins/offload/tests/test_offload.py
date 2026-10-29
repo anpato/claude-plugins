@@ -6,9 +6,12 @@ Integration tests run the real sandbox-exec (darwin only) and never start claude
 The OFFLOAD_HOME override is the global `--home DIR` option (or the `ohome` argument of the
 functions); it is not an environment variable and cannot influence the base URL.
 """
+import getpass
+import hashlib
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -21,6 +24,13 @@ import offload  # noqa: E402
 HOME = offload.real_home()
 CAN_SANDBOX = sys.platform == "darwin" and os.path.exists("/usr/bin/sandbox-exec")
 needs_sandbox = pytest.mark.skipif(not CAN_SANDBOX, reason="needs darwin and /usr/bin/sandbox-exec")
+
+
+@pytest.fixture(autouse=True)
+def fake_netstat(monkeypatch, request):
+    """Most tests do not care which ports the host listens on; the test_snapshot_listen_ports* tests do."""
+    if not request.node.name.startswith("test_snapshot_listen_ports"):
+        monkeypatch.setattr(offload, "snapshot_listen_ports", lambda: {22, 11434, 18080})
 
 
 def fake_claude():
@@ -96,7 +106,7 @@ def test_profile_contents(tmp_path):
     # writes only inside the run's dirs and devices
     write = next(ln for ln in lines if ln.startswith("(allow file-write*"))
     assert f'(subpath "{run}/src")' in write and f'(subpath "{run}/git")' not in write
-    assert 'xcrun_db-' in write
+    assert 'xcrun_db' not in write  # the xcrun_db- write allow is gone; <T>xcrun_db is denied instead
     # ancestor metadata literals
     meta = next(ln for ln in lines if ln.startswith("(allow file-read-metadata"))
     for anc in offload._ancestors(run) + [run]:
@@ -106,7 +116,174 @@ def test_profile_contents(tmp_path):
 def test_profile_network_is_only_the_proxy_port(tmp_path):
     text = profile_for(tmp_path, proxy_port=9999)
     net = [ln for ln in text.splitlines() if ln.startswith(("(deny network", "(allow network"))]
-    assert net == ["(deny network*)", '(allow network-outbound (remote ip "localhost:9999"))']
+    assert net[0] == "(deny network*)" and net[-1] == '(allow network-outbound (remote tcp "localhost:9999"))'
+    assert not any(" ip " in ln for ln in net)  # TCP only
+
+
+NETSTAT_SAMPLE = """Active Internet connections (including servers)
+Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)          rxbytes      txbytes  rhiwat  shiwat          process:pid    state  options           gencnt    flags   flags1 usecnt rtncnt fltrs
+tcp4       0      0  127.0.0.1.51740        127.0.0.1.53366        ESTABLISHED         1152          621  407808  146988           Ollama:70586  00102 0000000c 00000000049801c6 00000080 01000800      2      0 000000
+tcp4       0      0  127.0.0.1.11434        *.*                    LISTEN                 0            0  131072  131072           ollama:70771  00100 00000006 000000000448e2b6 00000000 00000800      1      0 000000
+tcp4       0      0  *.5000                 *.*                    LISTEN                 0            0  131072  131072         ControlCe:589  00100 00000006 0000000004483f30 00000000 00000800      1      0 000000
+tcp6       0      0  ::1.18080              *.*                    LISTEN                 0            0  131072  131072             node:61509  00100 00000106 00000000044783e8 00000001 00000800      1      0 000000
+tcp46      0      0  *.6379                 *.*                    LISTEN                 0            0  131072  131072     redis-ser:1  00100 00000006 0000000004483f31 00000000 00000800      1      0 000000
+tcp4       0      0  127.0.0.1.22           *.*                    TIME_WAIT              0            0  131072  131072             node:61509  00100 00000106 00000000044783e9 00000001 00000800      1      0 000000
+"""
+
+
+def test_parse_netstat_listeners():
+    assert offload.parse_netstat_listeners(NETSTAT_SAMPLE) == {11434, 5000, 18080, 6379}
+    assert offload.parse_netstat_listeners("") == set()
+
+
+def test_snapshot_listen_ports_sees_a_listener():
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen()
+    try:
+        try:
+            ports = offload.snapshot_listen_ports()
+        except offload.OffloadError:
+            pytest.skip("netstat shows no TCP sockets in this process tree (seen under Homebrew python in the agent shell)")
+        assert srv.getsockname()[1] in ports
+    finally:
+        srv.close()
+
+
+def test_snapshot_listen_ports_fails_closed(monkeypatch):
+    monkeypatch.setattr(offload.subprocess, "run",
+                        lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout="Proto\n", stderr=""))
+    with pytest.raises(offload.OffloadError, match="snapshot"):
+        offload.snapshot_listen_ports()
+
+
+def test_profile_loopback_rules(tmp_path):
+    text = profile_for(tmp_path, proxy_port=9999, host_ports=[22, 11434], temp_dir=None, cache_dir=None)
+    net = [ln for ln in text.splitlines() if ln.startswith(("(deny network", "(allow network"))]
+    assert net[1:] == ['(allow network-outbound (remote tcp "localhost:*"))',
+                       '(allow network-bind network-inbound (local tcp "localhost:*"))',
+                       '(deny network-bind network-inbound (local tcp "localhost:22") (local tcp "localhost:9999") '
+                       '(local tcp "localhost:11434"))',
+                       '(allow network-outbound (remote tcp "localhost:9999"))']
+    assert "(deny network-outbound" not in text  # connect denies are not enforceable; none are claimed
+
+
+def test_profile_allow_listen_off(tmp_path, monkeypatch):
+    monkeypatch.setattr(offload, "ALLOW_LISTEN", False)
+    text = profile_for(tmp_path, proxy_port=9999, temp_dir=None, cache_dir=None)
+    assert '(allow network-bind' not in text and "(allow network-inbound" not in text
+
+
+def test_profile_scratch_rules(tmp_path):
+    T, C = "/private/var/folders/ab/cd/T/", "/private/var/folders/ab/cd/C/"
+    entries = {"/private/tmp": ["old.txt", "we ird(1)", 'q"uote'], T[:-1]: ["keep-me"], C[:-1]: []}
+    text = profile_for(tmp_path, temp_dir=T, cache_dir=C, temp_entries=entries)
+    lines = text.splitlines()
+    i = lines.index('(allow file-read* file-write* (subpath "/private/tmp") (subpath "%s") (subpath "%s"))' % (T[:-1], C[:-1]))
+    after = "\n".join(lines[i:])
+    assert r'^/private/tmp/(old\.txt|q[^/]*uote|we\ ird\(1\))(/|$)' in after
+    assert r'/(keep-me)(/|$)' in after
+    assert r'(regex #"^/private/tmp/claude")' in after
+    assert r'(regex #"^/private/var/folders/ab/cd/T/ccd-")' in after
+    assert r'com\.anthropic\.' in after and r'(regex #"^/private/var/folders/ab/cd/C/claude")' in after
+    assert r'(literal "/private/var/folders/ab/cd/T/xcrun_db")' in after
+    assert r'(\.git|\.claude|CLAUDE(\.local)?\.md|HEAD)' in after and "node_modules" in after
+    roots = '(subpath "/private/tmp")'
+    assert '(deny file-write* (literal "/private/tmp") (literal "%s") (literal "%s"))' % (T[:-1], C[:-1]) in after
+    # the always-denied rules come last, after every snapshot rule
+    assert lines.index(next(ln for ln in lines if "keep-me" in ln)) < lines.index(next(ln for ln in lines if "ccd-" in ln))
+
+
+def test_shorten_entries_keeps_every_name_covered():
+    small = {"/r": ["a", "bb"]}
+    assert offload.shorten_entries(small) == ({"/r": [("a", True), ("bb", True)]}, None)
+    names = [hashlib.md5(str(i).encode()).hexdigest() for i in range(6000)]  # random-looking, like UUID temp dirs
+    out, L = offload.shorten_entries({"/r": names}, budget=20000)
+    assert L is not None and L < 32
+    for n in names:  # every original name still matches a kept pattern
+        assert any(n == p if exact else n.startswith(p) for p, exact in out["/r"])
+    with pytest.raises(offload.OffloadError):
+        offload.shorten_entries({"/r": names}, budget=10)
+    rules = offload.entry_deny_rules("/r", out["/r"])
+    assert all(len(r) < 1024 for r in rules)
+
+
+def test_claude_argv_add_dirs():
+    argv = offload.build_claude_argv("/real/claude", 3, ["/private/tmp", "/x/T"])
+    assert [argv[i + 1] for i, a in enumerate(argv) if a == "--add-dir"] == ["/private/tmp", "/x/T"]
+    assert "--add-dir" not in offload.build_claude_argv("/real/claude", 3)
+    assert offload.check_init({"mcp_servers": [], "permissionMode": "dontAsk", "tools": ["Bash"]}) == []
+
+
+@needs_sandbox
+def test_profile_compiles_with_real_snapshots(tmp_path):
+    entries = offload.snapshot_temp_entries(offload.temp_roots())
+    text = profile_for(tmp_path, proxy_port=9999, temp_entries=entries)
+    p = subprocess.run(["/usr/bin/sandbox-exec", "-p", text, "/usr/bin/true"], capture_output=True, text=True)
+    assert p.returncode == 0, p.stderr[:500]
+    assert sum(len(v) for v in entries.values()) > 0
+
+
+@needs_sandbox
+def test_scratch_dirs_in_sandbox(tmp_path):
+    """Entries that existed at snapshot time are denied; new ones, and the other dirs' contents, work."""
+    T = offload.user_temp_dir()
+    old = Path("/private/tmp") / f"offload-old-{os.getpid()}"
+    new = Path("/private/tmp") / f"offload-new-{os.getpid()}"
+    d = Path(T) / f"offload-newdir-{os.getpid()}"
+    old.write_text("secret")
+    try:
+        entries = offload.snapshot_temp_entries(offload.temp_roots())
+        text = profile_for(tmp_path, proxy_port=9999, temp_entries=entries)
+        prof = tmp_path / "p.sb"
+        prof.write_text(text)
+        sb = lambda *a: subprocess.run(["/usr/bin/sandbox-exec", "-f", str(prof), *a], capture_output=True, text=True)
+        assert "not permitted" in sb("/bin/cat", str(old)).stderr
+        r = sb("/bin/sh", "-c", f"echo hi > {new} && cat {new}"); assert r.stdout == "hi\n", r.stderr
+        assert "not permitted" in sb("/bin/mkdir", "/private/tmp/.git").stderr
+        assert not Path("/private/tmp/.git").exists() or Path("/private/tmp/.git").is_dir()
+        r = sb("/bin/sh", "-c", f"mkdir {d} && touch {d}/f && ls {d}"); assert r.stdout == "f\n", r.stderr
+        assert "not permitted" in sb("/bin/cat", T + "xcrun_db").stderr
+        assert "not permitted" in sb("/bin/mkdir", T + "claude-x").stderr
+        assert "not permitted" in sb("/bin/sh", "-c", f"echo x > {d}/HEAD").stderr  # implicit bare repo
+        assert "not permitted" in sb("/bin/sh", "-c", f"echo x > {T}HEAD").stderr
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+        new.unlink(missing_ok=True)
+        old.unlink(missing_ok=True)
+
+
+@needs_sandbox
+def test_worker_cannot_take_over_a_host_wildcard_listener(tmp_path):
+    host = socket.socket()
+    host.bind(("0.0.0.0", 0))
+    host.listen()
+    port = host.getsockname()[1]
+    code = ("import socket; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); "
+            f"s.bind(('127.0.0.1', {port})); s.listen()")
+    try:
+        for ports, taken in (([], True), ([port], False)):
+            prof = tmp_path / "p.sb"
+            prof.write_text(profile_for(tmp_path, proxy_port=9999, host_ports=ports, temp_dir=None, cache_dir=None))
+            r = subprocess.run(["/usr/bin/sandbox-exec", "-f", str(prof), "/usr/bin/python3", "-I", "-c", code],
+                               capture_output=True, text=True, cwd="/")
+            assert (r.returncode == 0) is taken, (ports, r.stderr[-300:])
+    finally:
+        host.close()
+
+
+@needs_sandbox
+def test_scratch_root_itself_cannot_be_chmodded_or_given_an_acl(tmp_path):
+    root = tmp_path / "scratch"  # stands in for <T>: a throwaway root, so a failed deny cannot hurt the real ones
+    root.mkdir()
+    root.chmod(0o755)
+    prof = tmp_path / "p.sb"
+    prof.write_text(profile_for(tmp_path, proxy_port=9999, temp_dir=str(root) + "/", cache_dir=None, temp_entries={}))
+    sb = lambda *a: subprocess.run(["/usr/bin/sandbox-exec", "-f", str(prof), *a], capture_output=True, text=True, cwd="/")
+    assert "not permitted" in sb("/bin/chmod", "700", str(root)).stderr
+    assert "not permitted" in sb("/bin/chmod", "+a", "everyone allow read", str(root)).stderr
+    assert sb("/bin/sh", "-c", f"mkdir {root}/a && echo x > {root}/a/f && mv {root}/a/f {root}/g && rm {root}/g").returncode == 0
+    assert oct(root.stat().st_mode & 0o777) == "0o755"
 
 
 def test_profile_src_dir_replaces_src(tmp_path):
@@ -175,7 +352,9 @@ def test_worker_env_exact_keys_and_no_inherited_token(monkeypatch):
         "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL",
         "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
         "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "MAX_THINKING_TOKENS",
-        "CARGO_HOME", "GOPROXY", "GOFLAGS", "GOSUMDB", "GOCACHE", "PYTHONDONTWRITEBYTECODE"}
+        "CARGO_HOME", "GOPROXY", "GOFLAGS", "GOSUMDB", "GOCACHE", "PYTHONDONTWRITEBYTECODE",
+        "USER", "LOGNAME", "UV_PYTHON_DOWNLOADS"}
+    assert env["USER"] == env["LOGNAME"] == getpass.getuser() and env["UV_PYTHON_DOWNLOADS"] == "never"
     assert "ANTHROPIC_AUTH_TOKEN" not in env
     assert env["ANTHROPIC_BASE_URL"] == "http://localhost:11434"
     assert env["HOME"] == "/r/home" and env["TMPDIR"] == "/r/tmp" == env["CLAUDE_CODE_TMPDIR"]
@@ -606,11 +785,14 @@ def test_integration_selftest_passes_and_isolation(tmp_path, repo):
     px = offload.EgressProxy(f"http://127.0.0.1:{up.port}", os.path.join(ctx["run_dir"], "proxy_rejects.log"))
     try:
         ctx["proxy_port"] = px.start()
+        ctx["host_ports"] = [up.port]  # a real host listener, as the netstat snapshot would report it
         offload.write_profile(ctx, ctx["proxy_port"])
         ok, results = offload.run_selftest(ctx, online=False)
         assert ok, results
         names = " | ".join(r["check"] for r in results)
-        for needle in ("proxy answers 403", "direct connect to localhost:11434", "pbpaste", "DNS lookup",
+        for needle in ("proxy answers 403", "binding the proxy port is denied", "binding a snapshotted host port is denied",
+                       "new file in /private/tmp", "existing /private/tmp entry", "/private/tmp/.git/x", "<T>xcrun_db",
+                       "fresh localhost port works", "UDP send to localhost", "proxy port is reachable", "pbpaste", "DNS lookup",
                        "CONNECT pypi.org:443", "absolute-form GET", "PUT /r/npm/x", "/r/pypi/../../x",
                        "/r/nope/", "(pypi not enabled)", "33rd concurrent"):
             assert needle in names, names
@@ -662,13 +844,13 @@ def test_integration_no_unix_sockets_and_proxy_only(tmp_path, repo):
         denied = sb("/usr/bin/python3", "-c", code)
         assert denied.returncode != 0 and "not permitted" in denied.stderr.lower(), denied.stderr
         srv.close()
-        # only the proxy port is reachable; the upstream's own port is not
+        # the proxy is reachable, and so is any other host listener (user decision 2026-10-29)
         ok_port = sb("/usr/bin/curl", "-s", "-m", "3", "-o", "/dev/null", "-w", "%{http_code}", "-X", "POST",
                      f"http://127.0.0.1:{ctx['proxy_port']}/v1/messages", "-d", "{}")
         assert ok_port.stdout == "200", ok_port
         direct = sb("/usr/bin/curl", "-s", "-m", "3", "-o", "/dev/null", "-w", "%{http_code}",
                     f"http://127.0.0.1:{up.port}/")
-        assert direct.returncode != 0 and direct.stdout == "000"
+        assert direct.returncode == 0 and direct.stdout != "000"
     finally:
         px.stop()
         up.close()
@@ -946,9 +1128,9 @@ def test_launch_worker_status_running_and_tool_calls(monkeypatch, tmp_path):
     assert _read_run_json(run_dir)["status"] == "prepared"
     w = offload.launch_worker(ctx, "brief", 30)
     assert w["saw_init"] and w["turns"] == 2
-    assert seen[0]["status"] == "running" and isinstance(seen[0]["started_at"], float)
+    assert seen[-1]["status"] == "running" and isinstance(seen[-1]["started_at"], float)
     assert ctx["record"]["tool_calls"] == 3  # text-only message not counted
-    assert ctx["record"]["last_activity_at"] >= seen[0]["started_at"]
+    assert ctx["record"]["last_activity_at"] >= seen[-1]["started_at"]
     assert _read_run_json(run_dir)["tool_calls"] >= 1  # at least the first (unthrottled) write landed
     assert [f for f in os.listdir(run_dir) if f.startswith("run.json")] == ["run.json"]
 
@@ -997,6 +1179,7 @@ def test_clt_constant_is_hardcoded():
 def test_registry_env_points_at_proxy():
     env = offload.build_worker_env("/r", "m", "http://127.0.0.1:5555", registries=("pypi", "npm"))
     assert env["PIP_INDEX_URL"] == "http://127.0.0.1:5555/r/pypi/simple" and env["PIP_TRUSTED_HOST"] == "127.0.0.1"
+    assert env["UV_DEFAULT_INDEX"] == "http://127.0.0.1:5555/r/pypi/simple" and env["UV_INSECURE_HOST"] == "127.0.0.1"
     assert env["NPM_CONFIG_REGISTRY"] == "http://127.0.0.1:5555/r/npm/"
     assert env["CARGO_HOME"] == "/r/home/.cargo"
     assert (env["GOPROXY"], env["GOFLAGS"], env["GOSUMDB"], env["GOCACHE"]) == ("off", "-mod=mod", "off", "/r/tmp/gocache")
@@ -1635,10 +1818,11 @@ def test_cmd_run_records_session_id(tmp_path, repo, monkeypatch, capsys):
     assert rec["session_id"] == "sess-123"
 
 
-# ------------------------------------------------------------------ registries are off by default (user decision 2026-10-27)
+# ------------------------------------------------------------------ registries are on by default (user decision 2026-10-29)
 
 def test_parse_registries():
     assert offload.parse_registries("") == [] and offload.parse_registries(None) == []
+    assert offload.parse_registries("none") == [] and offload.parse_registries(" none ") == []
     assert offload.parse_registries("maven, pypi,pypi") == ["pypi", "maven"]
     for bad in ("pip", "pypi,go", ","):
         with pytest.raises(offload.OffloadError):
@@ -1675,12 +1859,12 @@ def test_proxy_enables_only_named_registry_groups(tmp_path):
 
 def test_worker_env_and_configs_only_for_enabled_registries(tmp_path):
     none = offload.build_worker_env("/r", "m", "http://127.0.0.1:5")
-    assert not {"PIP_INDEX_URL", "PIP_TRUSTED_HOST", "NPM_CONFIG_REGISTRY"} & set(none)
+    assert not {"PIP_INDEX_URL", "PIP_TRUSTED_HOST", "UV_DEFAULT_INDEX", "UV_INSECURE_HOST", "NPM_CONFIG_REGISTRY"} & set(none)
     pip = offload.build_worker_env("/r", "m", "http://127.0.0.1:5", registries=["pypi"])
     assert "PIP_INDEX_URL" in pip and "NPM_CONFIG_REGISTRY" not in pip
     npm = offload.build_worker_env("/r", "m", "http://127.0.0.1:5", registries=["npm"])
     assert "NPM_CONFIG_REGISTRY" in npm and "PIP_INDEX_URL" not in npm
-    assert set(none) | {"PIP_INDEX_URL", "PIP_TRUSTED_HOST", "NPM_CONFIG_REGISTRY"} == offload.WORKER_ENV_KEYS
+    assert set(none) | {"PIP_INDEX_URL", "PIP_TRUSTED_HOST", "UV_DEFAULT_INDEX", "UV_INSECURE_HOST", "NPM_CONFIG_REGISTRY"} == offload.WORKER_ENV_KEYS
     offload.write_registry_configs(str(tmp_path), "http://127.0.0.1:5")
     assert not (tmp_path / "home" / ".cargo" / "config.toml").exists()
     assert not (tmp_path / "home" / ".m2" / "settings.xml").exists()
@@ -1706,7 +1890,10 @@ def test_cmd_run_registries_flag_recorded_and_unknown_rejected(tmp_path, repo, m
                 "text": "", "returncode": 0, "turns": 1, "survivors_killed": []}
     monkeypatch.setattr(offload, "launch_worker", fake_launch)
     base = ["--home", ohome, "run", "--repo", str(repo), "--brief", str(brief)]
-    assert offload.main(base + ["--slug", "off"]) == 0
+    assert offload.main(base + ["--slug", "default"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["registries"] == ["pypi", "npm", "crates", "maven"] and seen["m2"] is True and seen["cargo"] is True
+    assert offload.main(base + ["--slug", "off", "--registries", "none"]) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["registries"] == [] and seen["m2"] is False and seen["cargo"] is False
     rec = json.loads((Path(ohome) / "runs" / out["run_id"] / "run.json").read_text())
@@ -1716,6 +1903,16 @@ def test_cmd_run_registries_flag_recorded_and_unknown_rejected(tmp_path, repo, m
     assert out["registries"] == ["maven"] and seen["m2"] is True and seen["cargo"] is False
     rec = json.loads((Path(ohome) / "runs" / out["run_id"] / "run.json").read_text())
     assert rec["registries"] == ["maven"]
+    assert rec["host_listeners"] == [22, 11434, 18080]  # the faked snapshot
+    assert "blocked_ports" not in rec
+
+    def no_netstat():
+        raise offload.OffloadError("cannot snapshot host listeners (netstat failed)")
+    monkeypatch.setattr(offload, "snapshot_listen_ports", no_netstat)
+    seen.clear()
+    assert offload.main(base + ["--slug", "nonet"]) != 0  # fail closed: no snapshot, no run
+    cap = capsys.readouterr()
+    assert "snapshot host listeners" in cap.out + cap.err and "routes" not in seen  # the worker never launched
     runs_before = sorted(os.listdir(Path(ohome) / "runs"))
     assert offload.main(base + ["--slug", "bad", "--registries", "pypi,nope"]) != 0
     assert sorted(os.listdir(Path(ohome) / "runs")) == runs_before  # nothing prepared, nothing spent
