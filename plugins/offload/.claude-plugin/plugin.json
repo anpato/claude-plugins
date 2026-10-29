@@ -1,7 +1,7 @@
 {
   "name": "offload",
   "description": "Delegate a well-specified build task to a cheaper model (Kimi on Ollama Cloud) running in a macOS sandbox, then review the result as an untrusted diff before merging.",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "author": {
     "name": "apato"
   },
