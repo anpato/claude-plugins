@@ -571,6 +571,24 @@ def test_worker_conflicts_with_base_url_and_model(monkeypatch, tmp_path, capsys)
         assert rc == 2 and "--worker sets the base URL and model" in capsys.readouterr().out
 
 
+def test_worker_context_tokens(tmp_path):
+    cfg = write_workers(tmp_path, {
+        "ok": {"base_url": "http://localhost:1", "model": "m", "context_tokens": 131072},
+        "tiny": {"base_url": "http://localhost:2", "model": "m", "context_tokens": 100},
+        "str": {"base_url": "http://localhost:3", "model": "m", "context_tokens": "131072"},
+        "bool": {"base_url": "http://localhost:4", "model": "m", "context_tokens": True},
+    })
+    w = offload.list_workers(cfg)
+    assert w["ok"]["context_tokens"] == 131072
+    assert all("context_tokens" not in w[n] for n in ("tiny", "str", "bool"))
+
+
+def test_worker_env_context_tokens_only_when_set():
+    assert "CLAUDE_CODE_MAX_CONTEXT_TOKENS" not in offload.build_worker_env("/r", "m", "http://127.0.0.1:1")
+    env = offload.build_worker_env("/r", "m", "http://127.0.0.1:1", context_tokens=131072)
+    assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "131072"
+
+
 def test_worker_up_false_when_nothing_listens():
     assert offload.worker_up("http://127.0.0.1:1", timeout=1) is False
 
@@ -1157,6 +1175,23 @@ def test_progress_counts_and_throttles(tmp_path):
     p.tool_use(1)
     on_disk = _read_run_json(tmp_path)
     assert on_disk["tool_calls"] == 4 and on_disk["last_activity_at"] > 0
+
+
+def test_progress_writes_live_usage_and_context(tmp_path):
+    rec = {"status": "running"}
+    p = offload.Progress(str(tmp_path), rec, interval=0)
+    m1 = {"input_tokens": 1040, "cache_read_input_tokens": None, "output_tokens": 50}
+    m2 = {"input_tokens": 300, "cache_read_input_tokens": 1800, "cache_creation_input_tokens": 80, "output_tokens": 70}
+    p.usage([m1], m1)
+    assert _read_run_json(tmp_path)["context_tokens"] == 1040
+    p.usage([m1, m2], m2)
+    on_disk = _read_run_json(tmp_path)
+    assert on_disk["usage"] == {"input": 1340, "cache_read": 1800, "output": 120}
+    assert on_disk["context_tokens"] == 300 + 1800 + 80
+
+
+def test_sum_usage_treats_null_as_zero():
+    assert offload.sum_usage([{"input_tokens": None, "output_tokens": 3}, {}]) == {"input": 0, "cache_read": 0, "output": 3}
 
 
 def _fake_launch(monkeypatch, tmp_path, lines):

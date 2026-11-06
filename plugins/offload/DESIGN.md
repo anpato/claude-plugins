@@ -303,7 +303,8 @@ sandbox allows localhost TCP whatever the base URL is; only the proxy filters wh
 
 **Named workers.** `workers` in the same file maps a name to `{base_url, model}` (`run --worker NAME`). A worker's
 `base_url` counts as allowlisted and goes through the same checks (https unless loopback). Intended for Ollama on the
-user's own GPU boxes, reached through an SSH tunnel so the URL is loopback. Same sandbox as a cloud run.
+user's own GPU boxes, reached through an SSH tunnel so the URL is loopback. An optional `context_tokens` (4096 to 2M) becomes the worker's `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, so Claude Code
+compacts at the model's real window instead of the 200k it assumes for an unknown model. Same sandbox as a cloud run.
 
 ## Delegating-Claude protocol (skill)
 

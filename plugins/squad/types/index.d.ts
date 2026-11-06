@@ -20,6 +20,8 @@ export type SquadAgent = {
   usage: SquadUsage
   // Input side of the latest request: what the agent's context holds now.
   contextTokens: number
+  // The agent's own context window when it differs from the session's (an offload worker's model).
+  contextWindow?: number
   stepsDone?: number
   stepsTotal?: number
   note?: string
