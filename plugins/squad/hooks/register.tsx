@@ -150,6 +150,14 @@ const callsLabel = (a: SquadAgent): string =>
 
 const asText = (v: unknown): string | undefined => (typeof v === 'string' && v !== '' ? v : undefined)
 const asSeconds = (v: unknown): number | undefined => (typeof v === 'number' && Number.isFinite(v) ? v : undefined)
+const asCount = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0)
+
+// run.json `usage` is {input, cache_read, output}, written live by offload.
+const offloadUsage = (v: unknown): SquadUsage => {
+  if (typeof v !== 'object' || v === null) return ZERO
+  const u = v as Record<string, unknown>
+  return { input: asCount(u.input), output: asCount(u.output), cacheRead: asCount(u.cache_read), cacheWrite: 0 }
+}
 
 // One offload run.json as a row, or undefined when it is malformed, too old or
 // started by another session. Missing fields are unknown, never an error.
@@ -167,8 +175,9 @@ const offloadRow = (raw: unknown, now: number, sessionId: string): SquadAgent | 
     type: 'offload',
     model: asText(r.model) ?? '',
     toolCalls: typeof r.tool_calls === 'number' ? r.tool_calls : undefined,
-    usage: ZERO,
-    contextTokens: 0,
+    usage: offloadUsage(r.usage),
+    contextTokens: asCount(r.context_tokens),
+    contextWindow: asCount(r.context_window) || undefined,
   }
   if (isLive) return { ...base, status: 'running', startedAt: created !== undefined ? created * 1000 : now }
   if (state !== 'ok' && state !== 'failed' && state !== 'timeout') return undefined
@@ -459,7 +468,9 @@ export const register: Register = (on, options) => {
         ) : (
           <Text color={FAILED_COLOR}>✗</Text>
         )
-      const ctx = window > 0 ? `ctx ${Math.round((a.contextTokens / window) * 100)}% · ` : ''
+      // An offload worker's window is its own model's; without one (a cloud run) there is no honest percentage.
+      const w = a.type === 'offload' ? (a.contextWindow ?? 0) : window
+      const ctx = w > 0 ? `ctx ${Math.round((a.contextTokens / w) * 100)}% · ` : ''
       const meta = `${ctx}${formatTokens(totalTokens(a.usage))} · ${formatDuration((a.endedAt ?? now) - a.startedAt)}`
 
       const bar = (width: number) => {

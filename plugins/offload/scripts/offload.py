@@ -258,13 +258,17 @@ def read_config(path=None):
 
 
 def list_workers(path=None):
-    """Named workers from config `workers`: {name: {"base_url", "model"}}. Malformed entries are skipped."""
+    """Named workers from config `workers`: {name: {"base_url", "model"[, "context_tokens"]}}. Malformed entries are
+    skipped; an out-of-range context_tokens is dropped."""
     raw = read_config(path).get("workers")
     out = {}
     for name, w in (raw.items() if isinstance(raw, dict) else []):
         if (isinstance(w, dict) and isinstance(w.get("base_url"), str) and isinstance(w.get("model"), str)
                 and MODEL_RE.match(w["model"])):
             out[str(name)] = {"base_url": w["base_url"].rstrip("/"), "model": w["model"]}
+            ct = w.get("context_tokens")
+            if isinstance(ct, int) and not isinstance(ct, bool) and 4096 <= ct <= 2_000_000:
+                out[str(name)]["context_tokens"] = ct
     return out
 
 
@@ -407,7 +411,7 @@ def go_modcache(allow_read, home=None):
 
 
 def build_worker_env(run_dir, model, base_url, max_thinking=DEFAULT_MAX_THINKING, lang=None, allow_read=(),
-                     registries=()):
+                     registries=(), context_tokens=None):
     """Exactly the spec's key set. Nothing is inherited from os.environ except an optional LANG.
 
     base_url is the local proxy (P); the registry settings point at P/r/... and work only while it is up."""
@@ -441,6 +445,8 @@ def build_worker_env(run_dir, model, base_url, max_thinking=DEFAULT_MAX_THINKING
     mod = go_modcache(allow_read)
     if mod:
         env["GOMODCACHE"] = mod
+    if context_tokens:  # a worker's real window, so Claude Code compacts before the model runs out (it assumes 200k)
+        env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(int(context_tokens))
     return env
 
 
@@ -1331,8 +1337,15 @@ def write_run_json(run_dir, record):
 RUN_JSON_MIN_INTERVAL_S = 2.0
 
 
+def sum_usage(per_msg):
+    """{input, cache_read, output} summed over per-message usage dicts (Ollama sends null for missing fields)."""
+    tot = lambda k: sum(int(u.get(k) or 0) for u in per_msg)
+    return {"input": tot("input_tokens"), "cache_read": tot("cache_read_input_tokens"), "output": tot("output_tokens")}
+
+
 class Progress:
-    """Live fields of run.json: tool_calls and last_activity_at, written at most once per interval."""
+    """Live fields of run.json: tool_calls, usage, context_tokens and last_activity_at, written at most once per
+    interval."""
 
     def __init__(self, run_dir, record, interval=RUN_JSON_MIN_INTERVAL_S, clock=time.monotonic):
         self.run_dir, self.record, self.interval, self.clock = run_dir, record, interval, clock
@@ -1340,6 +1353,16 @@ class Progress:
 
     def tool_use(self, n):
         self.record["tool_calls"] = self.record.get("tool_calls", 0) + n
+        self._touch()
+
+    def usage(self, per_msg, last):
+        """per_msg: every message's usage so far; last: the latest one, whose prompt is the live context size."""
+        self.record["usage"] = sum_usage(per_msg)
+        self.record["context_tokens"] = sum(int(last.get(k) or 0) for k in
+                                            ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+        self._touch()
+
+    def _touch(self):
         self.record["last_activity_at"] = time.time()
         now = self.clock()
         if self.last_write is None or now - self.last_write >= self.interval:
@@ -1565,7 +1588,8 @@ def run_selftest(ctx, online=None):
     `online` says whether to run the probe that fetches a real registry page; None means run it only when
     pypi.org resolves from here (it is skipped when offline)."""
     env = build_worker_env(ctx["run_dir"], ctx["model"], worker_url(ctx), ctx["max_thinking"],
-                           allow_read=ctx.get("allow_read", ()), registries=ctx.get("registries", ()))
+                           allow_read=ctx.get("allow_read", ()), registries=ctx.get("registries", ()),
+                           context_tokens=ctx.get("context_tokens"))
     hm = real_home()
     results = []
     curl = "/usr/bin/curl"
@@ -1811,7 +1835,8 @@ WORKER_PREAMBLE = ("You are working in a copy of the repo, in the current direct
 def launch_worker(ctx, brief_text, timeout_s):
     """Step 5/6: run the worker, reading stream-json incrementally. Returns an outcome dict."""
     env = build_worker_env(ctx["run_dir"], ctx["model"], worker_url(ctx), ctx["max_thinking"],
-                           allow_read=ctx.get("allow_read", ()), registries=ctx.get("registries", ()))
+                           allow_read=ctx.get("allow_read", ()), registries=ctx.get("registries", ()),
+                           context_tokens=ctx.get("context_tokens"))
     argv = sandbox_argv(ctx["profile"], build_claude_argv(ctx["claude"]["real"], ctx["max_turns"], temp_roots()))
     preamble = WORKER_PREAMBLE
     log_path = os.path.join(ctx["run_dir"], "worker.jsonl")
@@ -1837,6 +1862,7 @@ def launch_worker(ctx, brief_text, timeout_s):
             msg = ev.get("message") or {}
             if isinstance(msg.get("usage"), dict):
                 per_msg[msg.get("id") or len(per_msg)] = msg["usage"]
+                progress.usage(per_msg.values(), msg["usage"])
             n_tools = 0
             for blk in msg.get("content") or []:
                 if isinstance(blk, dict) and blk.get("type") == "text":
@@ -1901,12 +1927,7 @@ def launch_worker(ctx, brief_text, timeout_s):
                 out["returncode"] = proc.wait()
     res = out["result"] or {}
     u = res.get("usage") if isinstance(res.get("usage"), dict) else None
-    if u is None:
-        u = {"input_tokens": sum(x.get("input_tokens", 0) for x in per_msg.values()),
-             "cache_read_input_tokens": sum(x.get("cache_read_input_tokens", 0) for x in per_msg.values()),
-             "output_tokens": sum(x.get("output_tokens", 0) for x in per_msg.values())}
-    out["usage"] = {"input": int(u.get("input_tokens", 0) or 0), "cache_read": int(u.get("cache_read_input_tokens", 0) or 0),
-                    "output": int(u.get("output_tokens", 0) or 0)}
+    out["usage"] = sum_usage([u] if u is not None else per_msg.values())
     out["turns"] = int(res.get("num_turns", 0) or 0)
     if isinstance(res.get("result"), str) and res["result"]:
         out["text"] = res["result"]
@@ -1990,11 +2011,16 @@ def cmd_run(args, ohome):
             raise OffloadError("--worker sets the base URL and model; don't pass --base-url or --model with it")
         w = resolve_worker(args.worker)
         args.base_url, args.model = w["base_url"], w["model"]
+        context_tokens = w.get("context_tokens")
+    else:
+        context_tokens = None
     args.model = args.model or DEFAULT_MODEL
     base = resolve_base_url(args.base_url)
     ctx = prepare_run(args.repo, slug, ohome, args.model, base, claude, args.allow_read,
                       args.max_thinking_tokens, args.max_turns, registries)
+    ctx["context_tokens"] = context_tokens
     rec = ctx["record"]
+    rec["context_window"] = context_tokens  # the worker's window when known (named workers), else null
 
     def finish(status, extra=None):
         rec["status"] = status
@@ -2209,7 +2235,8 @@ def cmd_list(args, ohome):
 
 
 def cmd_workers(args, ohome):
-    emit({"workers": [{"name": n, "model": w["model"], "base_url": w["base_url"], "up": worker_up(w["base_url"])}
+    emit({"workers": [{"name": n, "model": w["model"], "base_url": w["base_url"],
+                       "context_tokens": w.get("context_tokens"), "up": worker_up(w["base_url"])}
                       for n, w in sorted(list_workers().items())]})
     return 0
 

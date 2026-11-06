@@ -337,6 +337,37 @@ test('offload runs show as rows, and bad files are skipped', async ($, on) => {
   await ui.unmount()
 })
 
+test('offload rows show live tokens, and ctx against the worker window only', async ($, on) => {
+  const clock = mock.clock(on, { now: 10_000_000 })
+  mock.env(on, { HOME: '/home/u' })
+  sessionStub(on)
+  const dir = '/home/u/.cache/offload/runs'
+  const nowS = 10_000
+  const files: Record<string, string> = {
+    local: runJson({
+      run_id: 'local', slug: 'on-box', model: 'qwen3.6:35b-a3b-ctx131072', status: 'running', created: nowS - 30,
+      usage: { input: 20_000, cache_read: 12_000, output: 3_000 }, context_tokens: 32_768, context_window: 131_072,
+    }),
+    cloud: runJson({
+      run_id: 'cloud', slug: 'on-kimi', model: 'kimi-k3:cloud', status: 'running', created: nowS - 30,
+      usage: { input: 1_000, cache_read: null, output: 500 }, context_tokens: 9_000,
+    }),
+  }
+  on('fs.exists', (_$, e) => ({ value: e.path === dir }))
+  on('fs.list', () => ({ value: Object.keys(files).map(name => ({ name, kind: 'dir', size: 0, mtimeMs: 0, isLink: false })) }) as never)
+  on('fs.read', (_$, e) => ({ value: files[e.path.split('/').slice(-2)[0] ?? ''] ?? '' }) as never)
+  await startSession($)
+  await clock.advance(5_000)
+
+  const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', component: 'Pane', requestId: 'squad', props: pane })
+  // 32,768 of 131,072 is 25%; tokens are 20k + 12k + 3k.
+  expect(await ui.find({ text: /ctx 25% · 35k/ })).toBeDefined()
+  // A cloud run has no known window: tokens, but no percentage.
+  expect(await ui.find({ text: /1\.5k · / })).toBeDefined()
+  expect(await ui.find({ text: /ctx \d+% · 1\.5k/ })).toBeUndefined()
+  await ui.unmount()
+})
+
 test('offload polling is throttled and never breaks the panel', async ($, on) => {
   const clock = mock.clock(on, { now: 10_000_000 })
   mock.env(on, { HOME: '/home/u' })
