@@ -8,7 +8,7 @@ Design, threat model and evidence: [DESIGN.md](./DESIGN.md).
 
 - macOS with `/usr/bin/sandbox-exec`. Other platforms are refused.
 - Python 3 (stdlib only) and git.
-- The `claude` binary on `PATH`. Only versions in `TESTED_CLAUDE_VERSIONS` (currently `2.1.312`) run unless you pass `--allow-untested-claude`.
+- The `claude` binary on `PATH`. Any version: each run checks the worker's init event (tools, permission mode, no MCP) and runs the sandbox self-test, and aborts on a mismatch.
 - A local `ollama` daemon on `localhost:11434`, signed in to Ollama Cloud, on a plan that includes the cloud model (Pro allows 3 concurrent runs).
 
 ## Install
@@ -31,6 +31,19 @@ offload.py list | status --run ID | discard --run ID
 A run leaves the branch `offload/<slug>` in your repo. Nothing is merged or pushed; merge it yourself after review.
 
 Other base URLs are read only from `~/.config/offload/config.json` (`{"base_urls": ["https://..."]}`), never from env or repo files, and a non-loopback host must use https. Run data lives in `~/.cache/offload` (override with the global `--home DIR`, used by the tests).
+
+## Local GPU workers
+
+Ollama on your own GPU machines can take runs too. Name them in `~/.config/offload/config.json`:
+
+```json
+{"workers": {
+  "gpu-1": {"base_url": "http://localhost:11435", "model": "qwen3.6:35b-a3b"},
+  "gpu-2": {"base_url": "http://localhost:11436", "model": "qwen3.6:35b-a3b"}
+}}
+```
+
+A worker's `base_url` counts as allowlisted. Reach a LAN box through an SSH tunnel (`ssh -N -L 11435:127.0.0.1:11434 gpu-1`) so the URL stays loopback; a non-loopback URL still needs https. `offload.py workers` lists them with whether each answers, and `offload.py run --worker gpu-1 ...` uses one (it sets `--base-url` and `--model`). Give each worker one run at a time: Ollama's prompt cache holds one conversation, and a second run evicts it. The sandbox is the same as for cloud runs.
 
 ## Security model, briefly
 

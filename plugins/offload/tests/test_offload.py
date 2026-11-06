@@ -527,6 +527,54 @@ def test_base_url_loopback_http_allowed_when_listed(tmp_path):
     assert offload.resolve_base_url("http://127.0.0.1:8080", cfg)["port"] == 8080
 
 
+# ------------------------------------------------------------------ workers
+
+def write_workers(tmp_path, workers, base_urls=()):
+    p = tmp_path / "workers.json"
+    p.write_text(json.dumps({"base_urls": list(base_urls), "workers": workers}))
+    return str(p)
+
+
+def test_workers_listed_and_malformed_skipped(tmp_path):
+    cfg = write_workers(tmp_path, {
+        "box-a": {"base_url": "http://localhost:11435/", "model": "qwen3.6:35b-a3b"},
+        "no-model": {"base_url": "http://localhost:11436"},
+        "bad-model": {"base_url": "http://localhost:11437", "model": "x; rm -rf /"},
+        "not-a-dict": "http://localhost:11438",
+    })
+    assert offload.list_workers(cfg) == {"box-a": {"base_url": "http://localhost:11435", "model": "qwen3.6:35b-a3b"}}
+    assert offload.resolve_worker("box-a", cfg)["model"] == "qwen3.6:35b-a3b"
+    with pytest.raises(offload.OffloadError, match="unknown worker"):
+        offload.resolve_worker("nope", cfg)
+
+
+def test_worker_base_url_is_allowlisted(tmp_path):
+    cfg = write_workers(tmp_path, {"box-a": {"base_url": "http://localhost:11435", "model": "m"}})
+    assert offload.resolve_base_url("http://localhost:11435", cfg)["port"] == 11435
+    with pytest.raises(offload.OffloadError, match="allowlist"):
+        offload.resolve_base_url("http://localhost:11436", cfg)
+
+
+def test_worker_non_loopback_still_needs_https(tmp_path):
+    cfg = write_workers(tmp_path, {"lan": {"base_url": "http://192.168.1.5:11434", "model": "m"}})
+    with pytest.raises(offload.OffloadError, match="https"):
+        offload.resolve_base_url("http://192.168.1.5:11434", cfg)
+
+
+def test_worker_conflicts_with_base_url_and_model(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(offload, "resolve_claude", lambda: {"link": "/x", "real": "/x", "version": "test"})
+    brief = tmp_path / "b.md"
+    brief.write_text("do it")
+    for extra in (["--base-url", "http://localhost:1"], ["--model", "m"]):
+        rc = offload.main(["--home", str(tmp_path / "h"), "run", "--repo", str(tmp_path), "--brief", str(brief),
+                           "--worker", "box-a", *extra])
+        assert rc == 2 and "--worker sets the base URL and model" in capsys.readouterr().out
+
+
+def test_worker_up_false_when_nothing_listens():
+    assert offload.worker_up("http://127.0.0.1:1", timeout=1) is False
+
+
 # ------------------------------------------------------------------ discard
 
 def make_run(ohome, run_dir_in_json, run_id="deadbeef-s"):

@@ -54,8 +54,8 @@ It must not be able to:
 1. **Validate.**
    - `R` is a git work tree. Its `realpath` is not `$HOME`, `~/.claude`, or under `OFFLOAD_HOME`.
    - The platform is darwin and `/usr/bin/sandbox-exec` exists.
-   - The `claude` binary is resolved with `shutil.which` and then `realpath`. The resolved version must be in
-     `TESTED_CLAUDE_VERSIONS`, unless `--allow-untested-claude` is passed.
+   - The `claude` binary is resolved with `shutil.which` and then `realpath`; its version is recorded, not pinned.
+     The init check and the sandbox self-test verify the behaviour that matters on every run.
    - The run dir doesn't already exist.
 2. **Check the branch name is free**, before any spend. Refuse if `refs/heads/offload/<slug>` or `refs/heads/offload`
    (a ref/directory conflict) exists, or if branches exist under `offload/<slug>/`.
@@ -300,6 +300,10 @@ tools may read it; they must not write it. It is written atomically (temp file i
 The default is `http://localhost:11434`. Other hosts are read only from `~/.config/offload/config.json` (`base_urls`
 allowlist), never from env or repo files. A non-loopback host requires https. The proxy forwards to that base URL; the
 sandbox allows localhost TCP whatever the base URL is; only the proxy filters what reaches Ollama.
+
+**Named workers.** `workers` in the same file maps a name to `{base_url, model}` (`run --worker NAME`). A worker's
+`base_url` counts as allowlisted and goes through the same checks (https unless loopback). Intended for Ollama on the
+user's own GPU boxes, reached through an SSH tunnel so the URL is loopback. Same sandbox as a cloud run.
 
 ## Delegating-Claude protocol (skill)
 

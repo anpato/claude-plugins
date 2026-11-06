@@ -6,10 +6,11 @@ See ../DESIGN.md for the threat model and the run flow.
 
   offload.py [--home DIR] run --repo R --brief F [--slug S] [--model M] [--max-turns N]
                               [--timeout-min T] [--max-thinking-tokens N] [--allow-read PATH]...
-                              [--base-url URL] [--allow-untested-claude]
+                              [--base-url URL | --worker NAME]
   offload.py [--home DIR] test --run ID [--timeout-s N] -- CMD...
   offload.py [--home DIR] diff --run ID [-- PATH...]
   offload.py [--home DIR] list
+  offload.py [--home DIR] workers
   offload.py [--home DIR] status --run ID
   offload.py [--home DIR] discard --run ID
 
@@ -37,11 +38,11 @@ import sys
 import tarfile
 import threading
 import time
+import urllib.request
 import unicodedata
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import quote, unquote, urljoin, urlsplit
 
-TESTED_CLAUDE_VERSIONS = {"2.1.312"}
 DEFAULT_MODEL = "kimi-k3:cloud"
 DEFAULT_BASE_URL = "http://localhost:11434"
 DEFAULT_MAX_TURNS = 60
@@ -242,11 +243,52 @@ def sensitive_paths(paths):
 
 # ------------------------------------------------------------------- base URL
 
+def config_file():
+    return os.path.join(real_home(), ".config", "offload", "config.json")
+
+
+def read_config(path=None):
+    """The user's config, or {} when missing or unreadable. Only ever read from the user's home."""
+    try:
+        with open(path or config_file()) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def list_workers(path=None):
+    """Named workers from config `workers`: {name: {"base_url", "model"}}. Malformed entries are skipped."""
+    raw = read_config(path).get("workers")
+    out = {}
+    for name, w in (raw.items() if isinstance(raw, dict) else []):
+        if (isinstance(w, dict) and isinstance(w.get("base_url"), str) and isinstance(w.get("model"), str)
+                and MODEL_RE.match(w["model"])):
+            out[str(name)] = {"base_url": w["base_url"].rstrip("/"), "model": w["model"]}
+    return out
+
+
+def resolve_worker(name, path=None):
+    workers = list_workers(path)
+    if name not in workers:
+        raise OffloadError(f"unknown worker {name!r}; configured: {sorted(workers)}")
+    return workers[name]
+
+
+def worker_up(base_url, timeout=3):
+    """True if the Ollama behind base_url answers /api/version."""
+    try:
+        with urllib.request.urlopen(base_url + "/api/version", timeout=timeout) as r:
+            return r.status == 200
+    except (OSError, ValueError):
+        return False
+
+
 def resolve_base_url(requested=None, config_path=None):
     """Return {'url', 'host', 'port'}. Never reads the environment for the URL.
 
-    The default is local ollama. Any other URL must be listed in `base_urls` in
-    ~/.config/offload/config.json, and a non-loopback host must use https.
+    The default is local ollama. Any other URL must be listed in `base_urls` (or be a worker's
+    `base_url`) in ~/.config/offload/config.json, and a non-loopback host must use https.
     """
     url = (requested or DEFAULT_BASE_URL).rstrip("/")
     parts = urlsplit(url)
@@ -258,12 +300,10 @@ def resolve_base_url(requested=None, config_path=None):
     except ValueError:
         raise OffloadError(f"invalid port in base URL {url!r}")
     if url != DEFAULT_BASE_URL:
-        path = config_path or os.path.join(real_home(), ".config", "offload", "config.json")
-        try:
-            with open(path) as f:
-                allowed = json.load(f).get("base_urls", [])
-        except (OSError, ValueError, AttributeError):
-            allowed = []
+        path = config_path or config_file()
+        cfg = read_config(path)
+        allowed = cfg.get("base_urls", []) if isinstance(cfg.get("base_urls"), list) else []
+        allowed = allowed + [w["base_url"] for w in list_workers(path).values()]
         if url not in [str(a).rstrip("/") for a in allowed if isinstance(a, str)]:
             raise OffloadError(f"base URL {url!r} is not in the base_urls allowlist in {path}")
     if host not in LOOPBACK_HOSTS and parts.scheme != "https":
@@ -322,7 +362,7 @@ def compare_refs(before, after, slug):
 
 # ----------------------------------------------------------------- claude binary
 
-def resolve_claude(allow_untested=False):
+def resolve_claude():
     link = shutil.which("claude")
     if not link:
         raise OffloadError("claude binary not found on PATH")
@@ -330,9 +370,6 @@ def resolve_claude(allow_untested=False):
     p = subprocess.run([real, "--version"], capture_output=True, text=True, shell=False, cwd="/",
                        env={"PATH": SAFE_PATH, "HOME": "/var/empty"}, timeout=30)
     version = p.stdout.strip().split()[0] if p.stdout.strip() else ""
-    if version not in TESTED_CLAUDE_VERSIONS and not allow_untested:
-        raise OffloadError(f"claude version {version or '?'} is not in TESTED_CLAUDE_VERSIONS "
-                           f"{sorted(TESTED_CLAUDE_VERSIONS)}; pass --allow-untested-claude to override")
     return {"link": os.path.abspath(link), "real": real, "version": version}
 
 
@@ -1947,7 +1984,13 @@ def cmd_run(args, ohome):
         brief = f.read()
     slug = validate_slug(args.slug or default_slug(args.brief))
     registries = parse_registries(args.registries)
-    claude = resolve_claude(args.allow_untested_claude)
+    claude = resolve_claude()
+    if args.worker:
+        if args.base_url or args.model:
+            raise OffloadError("--worker sets the base URL and model; don't pass --base-url or --model with it")
+        w = resolve_worker(args.worker)
+        args.base_url, args.model = w["base_url"], w["model"]
+    args.model = args.model or DEFAULT_MODEL
     base = resolve_base_url(args.base_url)
     ctx = prepare_run(args.repo, slug, ohome, args.model, base, claude, args.allow_read,
                       args.max_thinking_tokens, args.max_turns, registries)
@@ -2165,6 +2208,12 @@ def cmd_list(args, ohome):
     return 0
 
 
+def cmd_workers(args, ohome):
+    emit({"workers": [{"name": n, "model": w["model"], "base_url": w["base_url"], "up": worker_up(w["base_url"])}
+                      for n, w in sorted(list_workers().items())]})
+    return 0
+
+
 def cmd_status(args, ohome):
     emit(load_run(ohome, args.run))
     return 0
@@ -2199,14 +2248,14 @@ def build_parser():
     r.add_argument("--repo", required=True)
     r.add_argument("--brief", required=True)
     r.add_argument("--slug")
-    r.add_argument("--model", default=DEFAULT_MODEL)
+    r.add_argument("--model")
+    r.add_argument("--worker", help="a named worker from config `workers` (sets base URL and model)")
     r.add_argument("--max-turns", type=int, default=DEFAULT_MAX_TURNS)
     r.add_argument("--timeout-min", type=float, default=DEFAULT_TIMEOUT_MIN)
     r.add_argument("--max-thinking-tokens", type=int, default=DEFAULT_MAX_THINKING)
     r.add_argument("--allow-read", action="append", default=[])
     r.add_argument("--base-url")
     r.add_argument("--registries", default=",".join(REGISTRY_GROUPS), metavar="LIST")
-    r.add_argument("--allow-untested-claude", action="store_true")
     t = sub.add_parser("test")
     t.add_argument("--run", required=True)
     t.add_argument("--timeout-s", type=float, default=600)
@@ -2218,11 +2267,12 @@ def build_parser():
         s = sub.add_parser(name)
         s.add_argument("--run", required=True)
     sub.add_parser("list")
+    sub.add_parser("workers")
     return ap
 
 
 COMMANDS = {"run": cmd_run, "test": cmd_test, "diff": cmd_diff, "list": cmd_list, "status": cmd_status,
-            "discard": cmd_discard}
+            "discard": cmd_discard, "workers": cmd_workers}
 
 
 def main(argv=None):

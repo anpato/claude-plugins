@@ -2,9 +2,9 @@
 name: offload
 description: >-
   Delegate a well-specified build task (code plus tests, written to a reviewed brief) to a cheaper
-  model on Ollama Cloud, running in a macOS sandbox, then review the result as untrusted output.
-  Triggers on: "offload this", "hand this to kimi", "delegate the implementation", "build this on
-  the cheap model", "run this brief on ollama".
+  model (Ollama Cloud, or a local GPU worker), running in a macOS sandbox, then review the result as
+  untrusted output. Triggers on: "offload this", "hand this to kimi", "delegate the implementation",
+  "build this on the cheap model", "run this brief on ollama", "run this on my boxes", "use the local workers".
 argument-hint: "[brief file | task description]"
 allowed-tools:
   - Bash(python3 ${CLAUDE_PLUGIN_ROOT}/scripts/offload.py run *)
@@ -12,6 +12,7 @@ allowed-tools:
   - Bash(python3 ${CLAUDE_PLUGIN_ROOT}/scripts/offload.py test *)
   - Bash(python3 ${CLAUDE_PLUGIN_ROOT}/scripts/offload.py list)
   - Bash(python3 ${CLAUDE_PLUGIN_ROOT}/scripts/offload.py status *)
+  - Bash(python3 ${CLAUDE_PLUGIN_ROOT}/scripts/offload.py workers)
 user-invocable: true
 ---
 
@@ -20,15 +21,16 @@ user-invocable: true
 Hand a settled build task to a cheaper worker model and spend your own tokens only on the brief and the review.
 
 ```
-python3 ${CLAUDE_PLUGIN_ROOT}/scripts/offload.py run --repo R --brief FILE [--slug S] [--model M] [--max-turns N] [--timeout-min T] [--allow-read PATH]... [--registries LIST|none]
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/offload.py run --repo R --brief FILE [--slug S] [--model M | --worker NAME] [--max-turns N] [--timeout-min T] [--allow-read PATH]... [--registries LIST|none]
 python3 ${CLAUDE_PLUGIN_ROOT}/scripts/offload.py diff --run ID [-- PATH...]
 python3 ${CLAUDE_PLUGIN_ROOT}/scripts/offload.py test --run ID -- CMD...
 python3 ${CLAUDE_PLUGIN_ROOT}/scripts/offload.py list
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/offload.py workers
 python3 ${CLAUDE_PLUGIN_ROOT}/scripts/offload.py status --run ID
 python3 ${CLAUDE_PLUGIN_ROOT}/scripts/offload.py discard --run ID
 ```
 
-Always use exactly that `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/offload.py ...` prefix. `run`, `diff`, `test`, `list` and `status` are pre-approved; `discard` is not, so it prompts. Each command prints JSON; `diff` prints the diff and then a JSON trailer.
+Always use exactly that `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/offload.py ...` prefix. `run`, `diff`, `test`, `list`, `status` and `workers` are pre-approved; `discard` is not, so it prompts. Each command prints JSON; `diff` prints the diff and then a JSON trailer.
 
 Arguments given: `$ARGUMENTS`
 
@@ -67,6 +69,8 @@ The exact test command and the output that counts as passing.
 No secrets and no personal content: the worker's model calls leave the machine. The worker sees only the tracked files at HEAD, so uncommitted changes are not included; tell the user if the working tree is dirty.
 
 ## 3. Run it
+
+**Pick the worker first.** Run `offload.py workers`. It lists the user's named local GPU workers (from `~/.config/offload/config.json`) with `up: true/false`. If any worker is up, use it with `--worker NAME` (it sets the model and base URL; don't also pass `--model` or `--base-url`), and give each worker **one run at a time**: a second concurrent run on the same box evicts the first one's prompt cache. Spread parallel runs across workers, and fall back to the default cloud model only when every worker is busy or down, or when the user asks for it. A first run on a cold worker spends about a minute loading the model.
 
 Run `offload.py run` in the background. Run at most 3 at once. The `run *` pre-approval also matches `--allow-read` (a pattern can't exclude one flag), so the rule lives here: **ask the user to confirm before passing any `--allow-read`.** The helper accepts only an allowlist of toolchain caches (`~/go/pkg/mod`, `~/.cargo/registry`, `~/.cargo/git`, `~/.rustup`, `~/.m2/repository`, `~/.gradle/caches`, `~/.npm/_cacache`, and the repo's `node_modules`, `vendor`, `.venv`) and refuses everything else.
 
