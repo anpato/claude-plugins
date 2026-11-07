@@ -279,10 +279,13 @@ def resolve_worker(name, path=None):
     return workers[name]
 
 
-def worker_up(base_url, timeout=3):
-    """True if the Ollama behind base_url answers /api/version."""
+def worker_up(base_url, model, timeout=3):
+    """True if the Ollama behind base_url answers and has `model`. A dead tunnel, a stopped WSL or a missing model
+    all read as down. /api/show reads the manifest only; it does not load the model."""
+    req = urllib.request.Request(base_url + "/api/show", data=json.dumps({"model": model}).encode(),
+                                 headers={"Content-Type": "application/json"}, method="POST")
     try:
-        with urllib.request.urlopen(base_url + "/api/version", timeout=timeout) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status == 200
     except (OSError, ValueError):
         return False
@@ -2010,6 +2013,9 @@ def cmd_run(args, ohome):
         if args.base_url or args.model:
             raise OffloadError("--worker sets the base URL and model; don't pass --base-url or --model with it")
         w = resolve_worker(args.worker)
+        if not worker_up(w["base_url"], w["model"]):
+            raise OffloadError(f"worker {args.worker!r} is down: {w['base_url']} does not answer for {w['model']}; "
+                               "pick another worker (offload.py workers) or the cloud model")
         args.base_url, args.model = w["base_url"], w["model"]
         context_tokens = w.get("context_tokens")
     else:
@@ -2236,7 +2242,7 @@ def cmd_list(args, ohome):
 
 def cmd_workers(args, ohome):
     emit({"workers": [{"name": n, "model": w["model"], "base_url": w["base_url"],
-                       "context_tokens": w.get("context_tokens"), "up": worker_up(w["base_url"])}
+                       "context_tokens": w.get("context_tokens"), "up": worker_up(w["base_url"], w["model"])}
                       for n, w in sorted(list_workers().items())]})
     return 0
 
