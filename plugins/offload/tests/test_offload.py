@@ -14,6 +14,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -590,7 +591,46 @@ def test_worker_env_context_tokens_only_when_set():
 
 
 def test_worker_up_false_when_nothing_listens():
-    assert offload.worker_up("http://127.0.0.1:1", timeout=1) is False
+    assert offload.worker_up("http://127.0.0.1:1", "m", timeout=1) is False
+
+
+@pytest.fixture
+def fake_ollama():
+    """A stand-in for Ollama's /api/show: 200 for the model "have", 404 otherwise."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+            ok = self.path == "/api/show" and body.get("model") == "have"
+            self.send_response(200 if ok else 404)
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *a):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{srv.server_address[1]}"
+    srv.shutdown()
+
+
+def test_worker_up_needs_the_model(fake_ollama):
+    assert offload.worker_up(fake_ollama, "have") is True
+    assert offload.worker_up(fake_ollama, "missing") is False
+
+
+def test_run_refuses_a_down_worker_before_any_spend(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(offload, "resolve_claude", lambda: {"link": "/x", "real": "/x", "version": "test"})
+    monkeypatch.setattr(offload, "resolve_worker", lambda name: {"base_url": "http://127.0.0.1:1", "model": "m"})
+    prepared = []
+    monkeypatch.setattr(offload, "prepare_run", lambda *a, **k: prepared.append(1))
+    brief = tmp_path / "b.md"
+    brief.write_text("do it")
+    rc = offload.main(["--home", str(tmp_path / "h"), "run", "--repo", str(tmp_path), "--brief", str(brief),
+                       "--worker", "box-a"])
+    assert rc == 2 and "is down" in capsys.readouterr().out and not prepared
 
 
 # ------------------------------------------------------------------ discard
