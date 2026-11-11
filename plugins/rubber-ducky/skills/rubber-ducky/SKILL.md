@@ -8,6 +8,7 @@ description: >-
   "work through this with me". Routes to a sub-skill (five-whys, tradeoff-analysis,
   decision-matrix, problem-decomposition) or hands off to plan mode once a direction is clear.
 user-invocable: true
+disable-model-invocation: true
 ---
 
 # Rubber Ducky

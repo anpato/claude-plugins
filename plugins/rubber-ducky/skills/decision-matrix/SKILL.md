@@ -7,6 +7,7 @@ description: >-
   More rigorous than tradeoff-analysis — use when stakes are high or the team needs a defensible
   record.
 user-invocable: true
+disable-model-invocation: true
 ---
 
 # Decision Matrix
@@ -102,9 +103,9 @@ Adjust and re-score if the user identifies a flaw. The matrix is a tool for thin
 
 Once the user is comfortable with the decision:
 - **Ready to implement** → "Want me to switch to plan mode for [chosen option]?"
-- **Decision should be documented** → "This was a thorough evaluation — want to capture it as an Architecture Decision Record?" (invoke `/rubber-ducky:adr`)
-- **Needs more exploration** → "Want to rubber-duck the details of [chosen option]?" (invoke `/rubber-ducky:rubber-ducky`)
-- **Needs to be broken down** → "This is a big undertaking — want to decompose it?" (invoke `/rubber-ducky:problem-decomposition`)
+- **Decision should be documented** → "This was a thorough evaluation — want to capture it as an Architecture Decision Record?" (on yes, tell the user to run `/rubber-ducky:adr`)
+- **Needs more exploration** → "Want to rubber-duck the details of [chosen option]?" (on yes, tell the user to run `/rubber-ducky:rubber-ducky`)
+- **Needs to be broken down** → "This is a big undertaking — want to decompose it?" (on yes, tell the user to run `/rubber-ducky:problem-decomposition`)
 
 ## Persistence
 

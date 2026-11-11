@@ -6,6 +6,7 @@ description: >-
   came back", "what is really causing this", "root cause analysis", "five whys", or a symptom
   whose underlying cause is unclear. Also invoked when rubber-ducky routes here.
 user-invocable: true
+disable-model-invocation: true
 ---
 
 # Five Whys
@@ -89,8 +90,8 @@ Once you've hit root cause, present the full chain clearly:
 
 Offer the user a choice:
 - **Root cause is clear, fix is obvious** → "Want me to switch to plan mode and lay out the fix?"
-- **Root cause found, but solution needs more thought** → "Want to go back to rubber-ducking to think through how to address this?" (invoke `/rubber-ducky:rubber-ducky`)
-- **Multiple possible fixes** → "There are a few ways to address this — want to run a tradeoff analysis?" (invoke `/rubber-ducky:tradeoff-analysis`)
+- **Root cause found, but solution needs more thought** → "Want to go back to rubber-ducking to think through how to address this?" (on yes, tell the user to run `/rubber-ducky:rubber-ducky`)
+- **Multiple possible fixes** → "There are a few ways to address this — want to run a tradeoff analysis?" (on yes, tell the user to run `/rubber-ducky:tradeoff-analysis`)
 
 ## Persistence
 
