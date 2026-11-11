@@ -10,6 +10,13 @@
   },
   "plugins": [
     {
+      "name": "clear-writing",
+      "source": "./plugins/clear-writing",
+      "description": "Write and edit clear, concise, accurate documentation. Cut repetition and clever phrasing while preserving meaning and evidence.",
+      "category": "productivity",
+      "keywords": ["writing", "editing", "documentation", "plain-language", "rfc"]
+    },
+    {
       "name": "rubber-ducky",
       "source": "./plugins/rubber-ducky",
       "description": "Think through a hard or fuzzy problem out loud before writing code — a Socratic partner that reflects, probes, and reframes rather than jumping to solutions.",

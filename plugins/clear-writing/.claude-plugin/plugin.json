@@ -1,0 +1,10 @@
+{
+  "name": "clear-writing",
+  "description": "Write and edit clear, concise, accurate documentation. Cut repetition and clever phrasing while preserving meaning and evidence.",
+  "version": "1.0.0",
+  "author": {
+    "name": "apato"
+  },
+  "license": "MIT",
+  "keywords": ["writing", "editing", "documentation", "plain-language", "rfc"]
+}
