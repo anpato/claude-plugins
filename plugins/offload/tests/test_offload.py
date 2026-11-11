@@ -1,20 +1,17 @@
-"""Tests for scripts/offload.py. Unit tests need no network and no model.
+"""Tests for scripts/offload.py. No network and no real model.
 
 Run: python3 -m pytest plugins/offload/tests -q
 
-Integration tests run the real sandbox-exec (darwin only) and never start claude.
-The OFFLOAD_HOME override is the global `--home DIR` option (or the `ohome` argument of the
-functions); it is not an environment variable and cannot influence the base URL.
+The integration tests run the real run flow with a *fake* worker binary (a small script that emits the
+worker's event stream and writes a file), so they exercise prepare_run/launch_worker/commit_work/fetch_work
+without Claude Code, codex or any model. The OFFLOAD_HOME override is the global `--home DIR` option (the
+`ohome` argument of the functions); it is not an environment variable.
 """
-import getpass
-import hashlib
 import json
 import os
-import shutil
-import socket
+import stat
 import subprocess
 import sys
-import threading
 from pathlib import Path
 
 import pytest
@@ -23,28 +20,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import offload  # noqa: E402
 
 HOME = offload.real_home()
-CAN_SANDBOX = sys.platform == "darwin" and os.path.exists("/usr/bin/sandbox-exec")
-needs_sandbox = pytest.mark.skipif(not CAN_SANDBOX, reason="needs darwin and /usr/bin/sandbox-exec")
 
 
-@pytest.fixture(autouse=True)
-def fake_netstat(monkeypatch, request):
-    """Most tests do not care which ports the host listens on; the test_snapshot_listen_ports* tests do."""
-    if not request.node.name.startswith("test_snapshot_listen_ports"):
-        monkeypatch.setattr(offload, "snapshot_listen_ports", lambda: {22, 11434, 18080})
+# ------------------------------------------------------------------ git helpers
+
+def git(repo, *args, env=None):
+    e = {"PATH": offload.SAFE_PATH, "HOME": str(repo), "GIT_CONFIG_GLOBAL": "/dev/null",
+         "GIT_CONFIG_NOSYSTEM": "1", "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+         "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    if env:
+        e.update(env)
+    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, env=e, check=True)
 
 
-def fake_claude():
-    link = shutil.which("claude")
-    if link:
-        return {"link": os.path.abspath(link), "real": os.path.realpath(link), "version": "test"}
-    return {"link": "/usr/bin/true", "real": "/usr/bin/true", "version": "test"}
-
-
-def profile_for(tmp_path, **kw):
-    run = tmp_path / "run"
-    cl = fake_claude()
-    return offload.generate_profile(str(run), cl["real"], cl["link"], **kw)
+def make_repo(tmp_path, name="repo"):
+    repo = tmp_path / name
+    repo.mkdir()
+    git(repo, "init", "-q")
+    (repo / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "init")
+    return repo
 
 
 # ------------------------------------------------------------------ slug, run id
@@ -67,2023 +63,362 @@ def test_run_id_deterministic():
     assert offload.RUN_ID_RE.match(a) and a.endswith("-s") and len(a.split("-")[0]) == 8
 
 
-# ------------------------------------------------------------------ SBPL, profile
+def test_default_slug():
+    assert offload.default_slug("/x/My Brief!.md") == "my-brief"
+    assert offload.SLUG_RE.match(offload.default_slug("/x/....md"))  # falls back to task-<hash>
 
-def test_sbpl_escaping_and_rejection():
-    assert offload.sbpl_str("/a/b c") == '"/a/b c"'
-    for bad in ('/a/"b', "/a/b\\c", "/a/\nb"):
-        with pytest.raises(offload.OffloadError):
-            offload.sbpl_str(bad)
 
+# ------------------------------------------------------------------ sanitize, cost, sensitive
 
-def test_profile_rejects_quote_in_path(tmp_path):
-    with pytest.raises(offload.OffloadError):
-        offload.generate_profile(str(tmp_path / 'ru"n'), "/usr/bin/true")
+def test_sanitize_strips_ansi_and_control():
+    out, st = offload.sanitize_untrusted_ex("\x1b[31mred\x1b[0m\x07\tok\n")
+    assert out == "red\tok\n" and st["format_chars"] == 0
 
 
-def test_profile_contents(tmp_path):
-    run = os.path.realpath(tmp_path / "run")
-    text = profile_for(tmp_path, repo_root="/some/repo", temp_dir="/private/var/folders/ab/cd/T/")
-    lines = text.splitlines()
-    assert lines[0] == "(version 1)" and lines[1] == "(allow default)"
-    deny_read = [ln for ln in lines if ln.startswith("(deny file-read*")]
-    assert f'(subpath "{HOME}")' in deny_read[0]
-    allow_read = [ln for ln in lines if ln.startswith("(allow file-read* ")]
-    assert allow_read and all(f"{run}/git" not in ln and "run.json" not in ln for ln in allow_read)
-    for d in ("src", "tmp", "home", "config"):
-        assert f'(subpath "{run}/{d}")' in allow_read[0]
-    assert f'(literal "{run}/profile.sb")' in allow_read[0]
-    assert any(f'(subpath "{run}/git")' in ln and 'run.json' in ln for ln in deny_read)
-    # network: everything denied, no unix sockets, and no allow at all without a proxy
-    net = [ln for ln in lines if ln.startswith(("(deny network", "(allow network"))]
-    assert net == ["(deny network*)"]
-    assert "unix-socket" not in text
-    assert "(deny appleevent-send)" in lines
-    mach = next(ln for ln in lines if ln.startswith("(deny mach-lookup"))
-    for name in ("com.apple.pasteboard.1", "com.apple.coreservices.launchservicesd", "com.apple.lsd.mapdb",
-                 "com.apple.lsd.modifydb", "com.apple.mDNSResponder",
-                 "com.apple.SystemConfiguration.DNSConfiguration"):
-        assert f'(global-name "{name}")' in mach
-    # writes only inside the run's dirs and devices
-    write = next(ln for ln in lines if ln.startswith("(allow file-write*"))
-    assert f'(subpath "{run}/src")' in write and f'(subpath "{run}/git")' not in write
-    assert 'xcrun_db' not in write  # the xcrun_db- write allow is gone; <T>xcrun_db is denied instead
-    # ancestor metadata literals
-    meta = next(ln for ln in lines if ln.startswith("(allow file-read-metadata"))
-    for anc in offload._ancestors(run) + [run]:
-        assert f'(literal "{anc}")' in meta
+def test_sanitize_marks_format_chars():
+    out, st = offload.sanitize_untrusted_ex("a‮b")  # RLO bidi override
+    assert "⟨U+202E⟩" in out and st["format_chars"] == 1
 
 
-def test_profile_network_is_only_the_proxy_port(tmp_path):
-    text = profile_for(tmp_path, proxy_port=9999)
-    net = [ln for ln in text.splitlines() if ln.startswith(("(deny network", "(allow network"))]
-    assert net[0] == "(deny network*)" and net[-1] == '(allow network-outbound (remote tcp "localhost:9999"))'
-    assert not any(" ip " in ln for ln in net)  # TCP only
+def test_sanitize_truncates():
+    out, st = offload.sanitize_untrusted_ex("x" * 100, limit=20)
+    assert st["truncated"] and out.endswith("[truncated]") and len(out.encode()) <= 20
 
 
-NETSTAT_SAMPLE = """Active Internet connections (including servers)
-Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)          rxbytes      txbytes  rhiwat  shiwat          process:pid    state  options           gencnt    flags   flags1 usecnt rtncnt fltrs
-tcp4       0      0  127.0.0.1.51740        127.0.0.1.53366        ESTABLISHED         1152          621  407808  146988           Ollama:70586  00102 0000000c 00000000049801c6 00000080 01000800      2      0 000000
-tcp4       0      0  127.0.0.1.11434        *.*                    LISTEN                 0            0  131072  131072           ollama:70771  00100 00000006 000000000448e2b6 00000000 00000800      1      0 000000
-tcp4       0      0  *.5000                 *.*                    LISTEN                 0            0  131072  131072         ControlCe:589  00100 00000006 0000000004483f30 00000000 00000800      1      0 000000
-tcp6       0      0  ::1.18080              *.*                    LISTEN                 0            0  131072  131072             node:61509  00100 00000106 00000000044783e8 00000001 00000800      1      0 000000
-tcp46      0      0  *.6379                 *.*                    LISTEN                 0            0  131072  131072     redis-ser:1  00100 00000006 0000000004483f31 00000000 00000800      1      0 000000
-tcp4       0      0  127.0.0.1.22           *.*                    TIME_WAIT              0            0  131072  131072             node:61509  00100 00000106 00000000044783e9 00000001 00000800      1      0 000000
-"""
-
-
-def test_parse_netstat_listeners():
-    assert offload.parse_netstat_listeners(NETSTAT_SAMPLE) == {11434, 5000, 18080, 6379}
-    assert offload.parse_netstat_listeners("") == set()
-
-
-def test_parse_lsof_listeners():
-    sample = "p1006\nf11\nn*:53643\np53819\nf20\nn127.0.0.1:4410\nf21\nn[::1]:18080\nfcwd\nn/Users/x\n"
-    assert offload.parse_lsof_listeners(sample) == {53643, 4410, 18080}
-    assert offload.parse_lsof_listeners("") == set()
-
-
-def test_snapshot_listen_ports_sees_a_listener():
-    srv = socket.socket()
-    srv.bind(("127.0.0.1", 0))
-    srv.listen()
-    try:
-        assert srv.getsockname()[1] in offload.snapshot_listen_ports()
-    finally:
-        srv.close()
-
-
-def test_snapshot_listen_ports_falls_back_to_lsof(monkeypatch):
-    def fake_run(argv, **kw):
-        out = "" if argv[0].endswith("netstat") else "p1\nf3\nn127.0.0.1:4410\n"
-        return subprocess.CompletedProcess(argv, 0, out, "")
-    monkeypatch.setattr(offload.subprocess, "run", fake_run)
-    assert offload.snapshot_listen_ports() == {4410}
-
-
-def test_snapshot_listen_ports_fails_closed_when_both_empty(monkeypatch):
-    monkeypatch.setattr(offload.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", ""))
-    with pytest.raises(offload.OffloadError, match="snapshot host listeners"):
-        offload.snapshot_listen_ports()
-
-
-def test_snapshot_listen_ports_fails_closed(monkeypatch):
-    monkeypatch.setattr(offload.subprocess, "run",
-                        lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout="Proto\n", stderr=""))
-    with pytest.raises(offload.OffloadError, match="snapshot"):
-        offload.snapshot_listen_ports()
-
-
-def test_profile_loopback_rules(tmp_path):
-    text = profile_for(tmp_path, proxy_port=9999, host_ports=[22, 11434], temp_dir=None, cache_dir=None)
-    net = [ln for ln in text.splitlines() if ln.startswith(("(deny network", "(allow network"))]
-    assert net[1:] == ['(allow network-outbound (remote tcp "localhost:*"))',
-                       '(allow network-bind network-inbound (local tcp "localhost:*"))',
-                       '(deny network-bind network-inbound (local tcp "localhost:22") (local tcp "localhost:9999") '
-                       '(local tcp "localhost:11434"))',
-                       '(allow network-outbound (remote tcp "localhost:9999"))']
-    assert "(deny network-outbound" not in text  # connect denies are not enforceable; none are claimed
-
-
-def test_profile_allow_listen_off(tmp_path, monkeypatch):
-    monkeypatch.setattr(offload, "ALLOW_LISTEN", False)
-    text = profile_for(tmp_path, proxy_port=9999, temp_dir=None, cache_dir=None)
-    assert '(allow network-bind' not in text and "(allow network-inbound" not in text
-
-
-def test_profile_scratch_rules(tmp_path):
-    T, C = "/private/var/folders/ab/cd/T/", "/private/var/folders/ab/cd/C/"
-    entries = {"/private/tmp": ["old.txt", "we ird(1)", 'q"uote'], T[:-1]: ["keep-me"], C[:-1]: []}
-    text = profile_for(tmp_path, temp_dir=T, cache_dir=C, temp_entries=entries)
-    lines = text.splitlines()
-    i = lines.index('(allow file-read* file-write* (subpath "/private/tmp") (subpath "%s") (subpath "%s"))' % (T[:-1], C[:-1]))
-    after = "\n".join(lines[i:])
-    assert r'^/private/tmp/(old\.txt|q[^/]*uote|we\ ird\(1\))(/|$)' in after
-    assert r'/(keep-me)(/|$)' in after
-    assert r'(regex #"^/private/tmp/claude")' in after
-    assert r'(regex #"^/private/var/folders/ab/cd/T/ccd-")' in after
-    assert r'com\.anthropic\.' in after and r'(regex #"^/private/var/folders/ab/cd/C/claude")' in after
-    assert r'(literal "/private/var/folders/ab/cd/T/xcrun_db")' in after
-    assert r'(\.git|\.claude|CLAUDE(\.local)?\.md|HEAD)' in after and "node_modules" in after
-    roots = '(subpath "/private/tmp")'
-    assert '(deny file-write* (literal "/private/tmp") (literal "%s") (literal "%s"))' % (T[:-1], C[:-1]) in after
-    # the always-denied rules come last, after every snapshot rule
-    assert lines.index(next(ln for ln in lines if "keep-me" in ln)) < lines.index(next(ln for ln in lines if "ccd-" in ln))
-
-
-def test_shorten_entries_keeps_every_name_covered():
-    small = {"/r": ["a", "bb"]}
-    assert offload.shorten_entries(small) == ({"/r": [("a", True), ("bb", True)]}, None)
-    names = [hashlib.md5(str(i).encode()).hexdigest() for i in range(6000)]  # random-looking, like UUID temp dirs
-    out, L = offload.shorten_entries({"/r": names}, budget=20000)
-    assert L is not None and L < 32
-    for n in names:  # every original name still matches a kept pattern
-        assert any(n == p if exact else n.startswith(p) for p, exact in out["/r"])
-    with pytest.raises(offload.OffloadError):
-        offload.shorten_entries({"/r": names}, budget=10)
-    rules = offload.entry_deny_rules("/r", out["/r"])
-    assert all(len(r) < 1024 for r in rules)
-
-
-def test_claude_argv_add_dirs():
-    argv = offload.build_claude_argv("/real/claude", 3, ["/private/tmp", "/x/T"])
-    assert [argv[i + 1] for i, a in enumerate(argv) if a == "--add-dir"] == ["/private/tmp", "/x/T"]
-    assert "--add-dir" not in offload.build_claude_argv("/real/claude", 3)
-    assert offload.check_init({"mcp_servers": [], "permissionMode": "dontAsk", "tools": ["Bash"]}) == []
-
-
-@needs_sandbox
-def test_profile_compiles_with_real_snapshots(tmp_path):
-    entries = offload.snapshot_temp_entries(offload.temp_roots())
-    text = profile_for(tmp_path, proxy_port=9999, temp_entries=entries)
-    p = subprocess.run(["/usr/bin/sandbox-exec", "-p", text, "/usr/bin/true"], capture_output=True, text=True)
-    assert p.returncode == 0, p.stderr[:500]
-    assert sum(len(v) for v in entries.values()) > 0
-
-
-@needs_sandbox
-def test_scratch_dirs_in_sandbox(tmp_path):
-    """Entries that existed at snapshot time are denied; new ones, and the other dirs' contents, work."""
-    T = offload.user_temp_dir()
-    old = Path("/private/tmp") / f"offload-old-{os.getpid()}"
-    new = Path("/private/tmp") / f"offload-new-{os.getpid()}"
-    d = Path(T) / f"offload-newdir-{os.getpid()}"
-    old.write_text("secret")
-    try:
-        entries = offload.snapshot_temp_entries(offload.temp_roots())
-        text = profile_for(tmp_path, proxy_port=9999, temp_entries=entries)
-        prof = tmp_path / "p.sb"
-        prof.write_text(text)
-        sb = lambda *a: subprocess.run(["/usr/bin/sandbox-exec", "-f", str(prof), *a], capture_output=True, text=True)
-        assert "not permitted" in sb("/bin/cat", str(old)).stderr
-        r = sb("/bin/sh", "-c", f"echo hi > {new} && cat {new}"); assert r.stdout == "hi\n", r.stderr
-        assert "not permitted" in sb("/bin/mkdir", "/private/tmp/.git").stderr
-        assert not Path("/private/tmp/.git").exists() or Path("/private/tmp/.git").is_dir()
-        r = sb("/bin/sh", "-c", f"mkdir {d} && touch {d}/f && ls {d}"); assert r.stdout == "f\n", r.stderr
-        assert "not permitted" in sb("/bin/cat", T + "xcrun_db").stderr
-        assert "not permitted" in sb("/bin/mkdir", T + "claude-x").stderr
-        assert "not permitted" in sb("/bin/sh", "-c", f"echo x > {d}/HEAD").stderr  # implicit bare repo
-        assert "not permitted" in sb("/bin/sh", "-c", f"echo x > {T}HEAD").stderr
-    finally:
-        shutil.rmtree(d, ignore_errors=True)
-        new.unlink(missing_ok=True)
-        old.unlink(missing_ok=True)
-
-
-@needs_sandbox
-def test_worker_cannot_take_over_a_host_wildcard_listener(tmp_path):
-    host = socket.socket()
-    host.bind(("0.0.0.0", 0))
-    host.listen()
-    port = host.getsockname()[1]
-    code = ("import socket; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); "
-            f"s.bind(('127.0.0.1', {port})); s.listen()")
-    try:
-        for ports, taken in (([], True), ([port], False)):
-            prof = tmp_path / "p.sb"
-            prof.write_text(profile_for(tmp_path, proxy_port=9999, host_ports=ports, temp_dir=None, cache_dir=None))
-            r = subprocess.run(["/usr/bin/sandbox-exec", "-f", str(prof), "/usr/bin/python3", "-I", "-c", code],
-                               capture_output=True, text=True, cwd="/")
-            assert (r.returncode == 0) is taken, (ports, r.stderr[-300:])
-    finally:
-        host.close()
-
-
-@needs_sandbox
-def test_scratch_root_itself_cannot_be_chmodded_or_given_an_acl(tmp_path):
-    root = tmp_path / "scratch"  # stands in for <T>: a throwaway root, so a failed deny cannot hurt the real ones
-    root.mkdir()
-    root.chmod(0o755)
-    prof = tmp_path / "p.sb"
-    prof.write_text(profile_for(tmp_path, proxy_port=9999, temp_dir=str(root) + "/", cache_dir=None, temp_entries={}))
-    sb = lambda *a: subprocess.run(["/usr/bin/sandbox-exec", "-f", str(prof), *a], capture_output=True, text=True, cwd="/")
-    assert "not permitted" in sb("/bin/chmod", "700", str(root)).stderr
-    assert "not permitted" in sb("/bin/chmod", "+a", "everyone allow read", str(root)).stderr
-    assert sb("/bin/sh", "-c", f"mkdir {root}/a && echo x > {root}/a/f && mv {root}/a/f {root}/g && rm {root}/g").returncode == 0
-    assert oct(root.stat().st_mode & 0o777) == "0o755"
-
-
-def test_profile_src_dir_replaces_src(tmp_path):
-    run = os.path.realpath(tmp_path / "run")
-    text = profile_for(tmp_path, src_dir=str(Path(run) / "testsrc-1"))
-    write = next(ln for ln in text.splitlines() if ln.startswith("(allow file-write*"))
-    assert f'(subpath "{run}/testsrc-1")' in write and f'(subpath "{run}/src")' not in write
-    read = next(ln for ln in text.splitlines() if ln.startswith("(allow file-read* "))
-    assert f'(subpath "{run}/src")' not in read
-
-
-def test_profile_allow_read_adds_subpath_and_ancestors(tmp_path):
-    cache = tmp_path / "cache"
-    cache.mkdir()
-    text = profile_for(tmp_path, allow_read=[str(cache)])
-    assert f'(subpath "{os.path.realpath(cache)}")' in text
-    assert f'(literal "{os.path.dirname(os.path.realpath(cache))}")' in text
-
-
-@pytest.mark.parametrize("sub", [".ssh", ".aws", ".claude", ".claude.json", ".config/x", "Library/y", ".kube",
-                                 ".docker", ".netrc", ".cargo", ".cargo/credentials.toml", "go", "", "Documents"])
-def test_allow_read_refuses_everything_off_the_allowlist(sub):
-    with pytest.raises(offload.OffloadError, match="allowlist"):
-        offload.validate_allow_read(os.path.join(HOME, sub), home=HOME)
-
-
-@pytest.mark.parametrize("sub", ["go/pkg/mod", "go/pkg/mod/x", ".cargo/registry", ".cargo/git", ".rustup",
-                                 ".m2/repository", ".gradle/caches", ".npm/_cacache"])
-def test_allow_read_accepts_toolchain_caches(sub):
-    assert offload.validate_allow_read(os.path.join(HOME, sub), home=HOME) == os.path.realpath(os.path.join(HOME, sub))
-
-
-def test_allow_read_repo_dirs_and_symlink_escape(tmp_path):
-    home = tmp_path / "h"
-    repo = tmp_path / "repo"
-    outside = tmp_path / "outside"
-    for d in (home, repo / "node_modules", outside):
-        d.mkdir(parents=True)
-    kw = {"home": str(home), "repo_root": str(repo)}
-    assert offload.validate_allow_read(str(repo / "node_modules"), **kw) == os.path.realpath(repo / "node_modules")
-    with pytest.raises(offload.OffloadError, match="allowlist"):
-        offload.validate_allow_read(str(repo / "src"), **kw)
-    # a symlink under the allowlist that points outside it is refused
-    (repo / "node_modules" / "link").symlink_to(outside)
-    with pytest.raises(offload.OffloadError, match="allowlist"):
-        offload.validate_allow_read(str(repo / "node_modules" / "link"), **kw)
-    # so is an allowlisted root that is itself a symlink leaving the repo
-    (repo / "vendor").symlink_to(outside)
-    with pytest.raises(offload.OffloadError, match="allowlist"):
-        offload.validate_allow_read(str(repo / "vendor"), **kw)
-    # and a symlink in the home allowlist pointing at a secret dir
-    (home / ".cargo").mkdir()
-    (home / ".cargo" / "registry").symlink_to(outside)
-    with pytest.raises(offload.OffloadError, match="allowlist"):
-        offload.validate_allow_read(str(home / ".cargo" / "registry" / "x"), home=str(home))
-
-
-# ------------------------------------------------------------------ env and argv
-
-def test_worker_env_exact_keys_and_no_inherited_token(monkeypatch):
-    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "secret")
-    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://evil.example")
-    env = offload.build_worker_env("/r", "kimi-k3:cloud", "http://localhost:11434")
-    assert set(env) == {
-        "PATH", "HOME", "LANG", "TMPDIR", "CLAUDE_CODE_TMPDIR", "TMPPREFIX", "CLAUDE_CONFIG_DIR",
-        "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL",
-        "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "MAX_THINKING_TOKENS",
-        "CARGO_HOME", "GOPROXY", "GOFLAGS", "GOSUMDB", "GOCACHE", "PYTHONDONTWRITEBYTECODE",
-        "USER", "LOGNAME", "UV_PYTHON_DOWNLOADS"}
-    assert env["USER"] == env["LOGNAME"] == getpass.getuser() and env["UV_PYTHON_DOWNLOADS"] == "never"
-    assert "ANTHROPIC_AUTH_TOKEN" not in env
-    assert env["ANTHROPIC_BASE_URL"] == "http://localhost:11434"
-    assert env["HOME"] == "/r/home" and env["TMPDIR"] == "/r/tmp" == env["CLAUDE_CODE_TMPDIR"]
-    assert env["TMPPREFIX"] == "/r/tmp/zsh"
-    assert env["MAX_THINKING_TOKENS"] == "8000"
-    assert all(env[k] == "kimi-k3:cloud" for k in env if k.startswith("ANTHROPIC_") and "MODEL" in k)
-
-
-def test_claude_argv():
-    argv = offload.build_claude_argv("/real/claude", 12)
-    assert argv[0] == "/real/claude" and argv[0] != "claude"
-    for flag in ("--bare", "--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence"):
-        assert flag in argv
-    i = argv.index("--setting-sources")
-    assert argv[i + 1] == ""
-    assert argv[argv.index("--tools") + 1] == "Bash,Read,Edit,Write,Glob,Grep"
-    assert argv[argv.index("--max-turns") + 1] == "12"
-    assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
-    assert argv[argv.index("--disallowedTools") + 1] == "WebFetch,WebSearch,Agent,Skill"
-    assert offload.sandbox_argv("/p.sb", argv)[:3] == ["/usr/bin/sandbox-exec", "-f", "/p.sb"]
-
-
-# ------------------------------------------------------------------ safe git
-
-def test_safe_git_prefix():
-    argv = offload.safe_git_argv(["-C", "/r", "status"], "/run/home", git_bin="/usr/bin/git")
-    assert argv[:9] == ["/usr/bin/env", "-i", f"PATH={offload.SAFE_PATH}", "HOME=/run/home",
-                        "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0",
-                        "/usr/bin/git", "-c"]
-    joined = " ".join(argv)
-    for opt in ("core.hooksPath=/dev/null", "core.fsmonitor=false", "core.attributesFile=/dev/null",
-                "core.excludesFile=/dev/null", "protocol.file.allow=always", "--no-pager"):
-        assert opt in joined
-    assert argv[-3:] == ["-C", "/r", "status"]
-
-
-def test_safe_git_ignores_planted_excludes(tmp_path):
-    work = tmp_path / "w"
-    work.mkdir()
-    ghome = tmp_path / "run" / "home"
-    (ghome / ".config" / "git").mkdir(parents=True)
-    (ghome / ".config" / "git" / "ignore").write_text("*\n")
-    offload.safe_git(["-C", str(work), "init", "-q"], str(ghome))
-    (work / "new.txt").write_text("x\n")
-    offload.safe_git(["-C", str(work), "add", "-A"], str(ghome))
-    staged = offload.safe_git(["-C", str(work), "diff", "--cached", "--name-only"], str(ghome)).stdout
-    assert staged.split() == ["new.txt"]
-
-
-def test_safe_git_diff_flags():
-    argv = offload.safe_git_argv(["--git-dir", "/g", "diff", "a", "b"], "/h", git_bin="/usr/bin/git")
-    i = argv.index("diff")
-    assert argv[i + 1:i + 3] == ["--no-ext-diff", "--no-textconv"]
-
-
-# ------------------------------------------------------------------ init check, refs
-
-GOOD_INIT = {"type": "system", "subtype": "init", "mcp_servers": [], "permissionMode": "dontAsk",
-             "tools": ["Bash", "Read", "Edit"]}
-
-
-def test_init_check_ok():
-    assert offload.check_init(GOOD_INIT) == []
-
-
-def test_init_check_rejects_mcp_and_extra_tools():
-    bad = dict(GOOD_INIT, mcp_servers=[{"name": "x", "status": "connected"}])
-    assert any("mcp_servers" in p for p in offload.check_init(bad))
-    bad = dict(GOOD_INIT, tools=["Bash", "WebFetch", "mcp__x__y"])
-    assert any("WebFetch" in p for p in offload.check_init(bad))
-    assert offload.check_init(dict(GOOD_INIT, permissionMode="default"))
-    assert offload.check_init({"type": "system", "subtype": "init"})
-
-
-def test_ref_compare():
-    before = {"refs/heads/main": "a" * 40, "refs/heads/dev": "b" * 40}
-    ok = dict(before, **{"refs/heads/offload/s": "c" * 40})
-    assert offload.compare_refs(before, ok, "s") == []
-    moved = dict(ok, **{"refs/heads/main": "d" * 40})
-    assert [v["ref"] for v in offload.compare_refs(before, moved, "s")] == ["refs/heads/main"]
-    assert offload.compare_refs(before, dict(ok, **{"refs/heads/extra": "e" * 40}), "s")
-    gone = {k: v for k, v in ok.items() if k != "refs/heads/dev"}
-    assert [v["ref"] for v in offload.compare_refs(before, gone, "s")] == ["refs/heads/dev"]
-
-
-# ------------------------------------------------------------------ text, cost
-
-def test_sanitize_strips_control_and_truncates():
-    dirty = "ok\x1b[31mred\x1b[0m\x00\x07 bell ‮RTL​\ttab\nline"
-    clean = offload.sanitize_untrusted(dirty)
-    assert clean == "okred bell ⟨U+202E⟩RTL⟨U+200B⟩\ttab\nline"
-    assert not any(ord(c) < 32 and c not in "\n\t" for c in clean)
-    assert "‮" not in clean and "​" not in clean
-    _, stats = offload.sanitize_untrusted_ex(dirty)
-    assert stats == {"truncated": False, "format_chars": 2}
-    assert offload.sanitize_untrusted_ex("é" * 10000)[1]["truncated"] is True
-    big = offload.sanitize_untrusted("é" * 10000)
-    assert len(big.encode()) <= offload.UNTRUSTED_LIMIT and big.endswith("[truncated]")
-    assert offload.sanitize_untrusted("short") == "short"
-
-
-def test_cost_estimate():
-    usage = {"input": 1_000_000, "cache_read": 2_000_000, "output": 100_000}
-    assert offload.estimate_cost("kimi-k3:cloud", usage) == pytest.approx(3.0 + 0.6 + 1.5)
-    assert offload.estimate_cost("kimi-k3:cloud", {}) == 0
-    assert offload.estimate_cost("unknown-model", usage) is None
+def test_estimate_cost_known_and_unknown():
+    c = offload.estimate_cost("kimi-k3:cloud", {"input": 1_000_000, "cache_read": 0, "output": 0})
+    assert c == 3.0
+    assert offload.estimate_cost("some-codex-model", {"input": 10, "output": 10}) is None
 
 
 def test_sensitive_paths():
-    paths = ["src/a.py", ".husky/pre-commit", "Makefile", "sub/run.sh", ".github/workflows/x.yml",
-             "package.json", "conftest.py", ".gitattributes", "lefthook.yml", "docs/readme.md", "a/.claude/x"]
-    got = offload.sensitive_paths(paths)
-    assert got == [p for p in paths if p not in ("src/a.py", "docs/readme.md")]
-    new = [".envrc", ".vscode/tasks.json", ".idea/x.xml", ".pre-commit-config.yaml", "pyproject.toml", "a/setup.cfg",
-           "x.pth", "sitecustomize.py", "usercustomize.py", "Justfile", "Rakefile", "Dockerfile",
-           "docker-compose.yml", "docker-compose.override.yml", ".npmrc", ".yarnrc", ".yarnrc.yml"]
-    assert offload.sensitive_paths(new) == new
-    assert offload.sensitive_paths(["a\x1b[31m/Makefile", "ev\u202eil.sh"]) == ["a/Makefile", "ev⟨U+202E⟩il.sh"]
+    got = offload.sensitive_paths(["src/app.py", "Makefile", ".github/x.yml", "a/.git/cfg", "run.sh",
+                                   "sub/pyproject.toml", ".codex/config.toml", "normal.txt"])
+    assert set(got) == {"Makefile", ".github/x.yml", "a/.git/cfg", "run.sh", "sub/pyproject.toml",
+                        ".codex/config.toml"}
 
 
-# ------------------------------------------------------------------ base URL
+# ------------------------------------------------------------------ workers, base url
 
-def write_cfg(tmp_path, urls):
-    p = tmp_path / "config.json"
-    p.write_text(json.dumps({"base_urls": urls}))
-    return str(p)
+def test_list_workers_filters(tmp_path):
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"workers": {
+        "good": {"base_url": "http://localhost:11435/", "model": "m:1", "context_tokens": 131072},
+        "badmodel": {"base_url": "http://localhost:1", "model": "bad model!"},
+        "nourl": {"model": "m"},
+        "badctx": {"base_url": "http://localhost:2", "model": "m", "context_tokens": 10},
+    }}))
+    w = offload.list_workers(str(cfg))
+    assert set(w) == {"good", "badctx"}
+    assert w["good"] == {"base_url": "http://localhost:11435", "model": "m:1", "context_tokens": 131072}
+    assert "context_tokens" not in w["badctx"]  # out of range dropped
 
 
-def test_base_url_default_and_env_ignored(monkeypatch, tmp_path):
-    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://evil.example")
-    monkeypatch.setenv("OFFLOAD_BASE_URL", "https://evil.example")
-    monkeypatch.setenv("OFFLOAD_HOME", str(tmp_path))
-    b = offload.resolve_base_url(config_path=str(tmp_path / "none.json"))
-    assert b == {"url": "http://localhost:11434", "host": "localhost", "port": 11434}
+def test_resolve_base_url_default():
+    assert offload.resolve_base_url()["url"] == offload.DEFAULT_BASE_URL
 
 
-def test_base_url_allowlist(tmp_path):
-    cfg = write_cfg(tmp_path, ["https://ollama.example.com"])
-    assert offload.resolve_base_url("https://ollama.example.com", cfg)["port"] == 443
+def test_resolve_base_url_rejects_unlisted(tmp_path):
+    cfg = tmp_path / "c.json"
+    cfg.write_text("{}")
     with pytest.raises(offload.OffloadError):
-        offload.resolve_base_url("https://other.example.com", cfg)
-    with pytest.raises(offload.OffloadError):
-        offload.resolve_base_url("http://localhost:9999", str(tmp_path / "missing.json"))
+        offload.resolve_base_url("http://localhost:9999", config_path=str(cfg))
 
 
-def test_base_url_http_non_loopback_rejected(tmp_path):
-    cfg = write_cfg(tmp_path, ["http://ollama.example.com:11434"])
-    with pytest.raises(offload.OffloadError, match="https"):
-        offload.resolve_base_url("http://ollama.example.com:11434", cfg)
+def test_resolve_base_url_allowlist_and_https(tmp_path):
+    cfg = tmp_path / "c.json"
+    cfg.write_text(json.dumps({"base_urls": ["http://localhost:9999", "http://1.2.3.4:5"]}))
+    assert offload.resolve_base_url("http://localhost:9999", config_path=str(cfg))["port"] == 9999
+    with pytest.raises(offload.OffloadError):  # listed but non-loopback http
+        offload.resolve_base_url("http://1.2.3.4:5", config_path=str(cfg))
 
 
-def test_base_url_loopback_http_allowed_when_listed(tmp_path):
-    cfg = write_cfg(tmp_path, ["http://127.0.0.1:8080"])
-    assert offload.resolve_base_url("http://127.0.0.1:8080", cfg)["port"] == 8080
+# ------------------------------------------------------------------ argv, env, init check
+
+def test_build_claude_argv():
+    argv = offload.build_claude_argv("/bin/claude", 42)
+    assert argv[0] == "/bin/claude" and "--max-turns" in argv and "42" in argv
+    assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
+    assert argv[argv.index("--tools") + 1] == ",".join(offload.ALLOWED_TOOLS)
 
 
-# ------------------------------------------------------------------ workers
-
-def write_workers(tmp_path, workers, base_urls=()):
-    p = tmp_path / "workers.json"
-    p.write_text(json.dumps({"base_urls": list(base_urls), "workers": workers}))
-    return str(p)
-
-
-def test_workers_listed_and_malformed_skipped(tmp_path):
-    cfg = write_workers(tmp_path, {
-        "box-a": {"base_url": "http://localhost:11435/", "model": "qwen3.6:35b-a3b"},
-        "no-model": {"base_url": "http://localhost:11436"},
-        "bad-model": {"base_url": "http://localhost:11437", "model": "x; rm -rf /"},
-        "not-a-dict": "http://localhost:11438",
-    })
-    assert offload.list_workers(cfg) == {"box-a": {"base_url": "http://localhost:11435", "model": "qwen3.6:35b-a3b"}}
-    assert offload.resolve_worker("box-a", cfg)["model"] == "qwen3.6:35b-a3b"
-    with pytest.raises(offload.OffloadError, match="unknown worker"):
-        offload.resolve_worker("nope", cfg)
+def test_build_codex_argv():
+    argv = offload.build_codex_argv("/bin/codex", "/run/src", "gpt-x", "/run/last.txt")
+    assert argv[:2] == ["/bin/codex", "exec"]
+    for flag in ("--json", "--skip-git-repo-check", "--ignore-user-config", "--ignore-rules"):
+        assert flag in argv
+    assert argv[argv.index("-C") + 1] == "/run/src"
+    assert argv[argv.index("-s") + 1] == "workspace-write"
+    assert argv[argv.index("-o") + 1] == "/run/last.txt"
+    assert argv[argv.index("-m") + 1] == "gpt-x"
+    assert "-m" not in offload.build_codex_argv("/bin/codex", "/s", None, "/l")  # model omitted
 
 
-def test_worker_base_url_is_allowlisted(tmp_path):
-    cfg = write_workers(tmp_path, {"box-a": {"base_url": "http://localhost:11435", "model": "m"}})
-    assert offload.resolve_base_url("http://localhost:11435", cfg)["port"] == 11435
-    with pytest.raises(offload.OffloadError, match="allowlist"):
-        offload.resolve_base_url("http://localhost:11436", cfg)
+def test_check_init():
+    ok = {"mcp_servers": [], "permissionMode": "dontAsk", "tools": list(offload.ALLOWED_TOOLS)}
+    assert offload.check_init(ok) == []
+    bad = {"mcp_servers": [{"x": 1}], "permissionMode": "acceptEdits", "tools": ["Bash", "WebFetch"]}
+    probs = offload.check_init(bad)
+    assert len(probs) == 3 and any("WebFetch" in p for p in probs)
 
 
-def test_worker_non_loopback_still_needs_https(tmp_path):
-    cfg = write_workers(tmp_path, {"lan": {"base_url": "http://192.168.1.5:11434", "model": "m"}})
-    with pytest.raises(offload.OffloadError, match="https"):
-        offload.resolve_base_url("http://192.168.1.5:11434", cfg)
+def test_build_worker_env_claude_vs_codex(tmp_path):
+    base = {"url": "http://localhost:11434"}
+    claude_ctx = {"run_dir": str(tmp_path), "kind": "claude", "model": "kimi:1", "base": base,
+                  "max_thinking": 8000, "context_tokens": 131072}
+    env = offload.build_worker_env(claude_ctx)
+    assert env["ANTHROPIC_BASE_URL"] == "http://localhost:11434" and env["ANTHROPIC_MODEL"] == "kimi:1"
+    assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "131072" and "CODEX_HOME" not in env
+    assert env["HOME"] == os.path.join(str(tmp_path), "home")
+
+    codex_ctx = {"run_dir": str(tmp_path), "kind": "codex", "model": None, "base": None}
+    cenv = offload.build_worker_env(codex_ctx)
+    assert cenv["CODEX_HOME"] == offload.codex_home() and "ANTHROPIC_BASE_URL" not in cenv
 
 
-def test_worker_conflicts_with_base_url_and_model(monkeypatch, tmp_path, capsys):
-    monkeypatch.setattr(offload, "resolve_claude", lambda: {"link": "/x", "real": "/x", "version": "test"})
-    brief = tmp_path / "b.md"
-    brief.write_text("do it")
-    for extra in (["--base-url", "http://localhost:1"], ["--model", "m"]):
-        rc = offload.main(["--home", str(tmp_path / "h"), "run", "--repo", str(tmp_path), "--brief", str(brief),
-                           "--worker", "box-a", *extra])
-        assert rc == 2 and "--worker sets the base URL and model" in capsys.readouterr().out
+# ------------------------------------------------------------------ resolve binaries
+
+def test_resolve_codex_no_binary(monkeypatch):
+    monkeypatch.setattr(offload.shutil, "which", lambda n: None)
+    with pytest.raises(offload.OffloadError, match="codex login|not found"):
+        offload.resolve_codex()
 
 
-def test_worker_context_tokens(tmp_path):
-    cfg = write_workers(tmp_path, {
-        "ok": {"base_url": "http://localhost:1", "model": "m", "context_tokens": 131072},
-        "tiny": {"base_url": "http://localhost:2", "model": "m", "context_tokens": 100},
-        "str": {"base_url": "http://localhost:3", "model": "m", "context_tokens": "131072"},
-        "bool": {"base_url": "http://localhost:4", "model": "m", "context_tokens": True},
-    })
-    w = offload.list_workers(cfg)
-    assert w["ok"]["context_tokens"] == 131072
-    assert all("context_tokens" not in w[n] for n in ("tiny", "str", "bool"))
+def test_resolve_codex_no_auth(monkeypatch, tmp_path):
+    monkeypatch.setattr(offload.shutil, "which", lambda n: "/usr/bin/true")
+    monkeypatch.setattr(offload, "codex_home", lambda: str(tmp_path / "nope"))
+    with pytest.raises(offload.OffloadError, match="codex login"):
+        offload.resolve_codex()
 
 
-def test_worker_env_context_tokens_only_when_set():
-    assert "CLAUDE_CODE_MAX_CONTEXT_TOKENS" not in offload.build_worker_env("/r", "m", "http://127.0.0.1:1")
-    env = offload.build_worker_env("/r", "m", "http://127.0.0.1:1", context_tokens=131072)
-    assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "131072"
+def test_resolve_codex_ok(monkeypatch, tmp_path):
+    ch = tmp_path / ".codex"
+    ch.mkdir()
+    (ch / "auth.json").write_text("{}")
+    monkeypatch.setattr(offload.shutil, "which", lambda n: "/usr/bin/true")
+    monkeypatch.setattr(offload, "codex_home", lambda: str(ch))
+    r = offload.resolve_codex()
+    assert r["kind"] == "codex" and r["real"]
 
 
-def test_worker_up_false_when_nothing_listens():
-    assert offload.worker_up("http://127.0.0.1:1", "m", timeout=1) is False
+# ------------------------------------------------------------------ refs, usage
+
+def test_compare_refs():
+    before = {"refs/heads/main": "a", "refs/heads/x": "b"}
+    after = {"refs/heads/main": "a", "refs/heads/x": "c", "refs/heads/offload/s": "d"}
+    bad = offload.compare_refs(before, after, "s")  # offload/s is the one allowed new branch
+    assert bad == [{"ref": "refs/heads/x", "before": "b", "after": "c"}]
 
 
-@pytest.fixture
-def fake_ollama():
-    """A stand-in for Ollama's /api/show: 200 for the model "have", 404 otherwise."""
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
-    class H(BaseHTTPRequestHandler):
-        def do_POST(self):
-            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
-            ok = self.path == "/api/show" and body.get("model") == "have"
-            self.send_response(200 if ok else 404)
-            self.end_headers()
-            self.wfile.write(b"{}")
-
-        def log_message(self, *a):
-            pass
-
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    yield f"http://127.0.0.1:{srv.server_address[1]}"
-    srv.shutdown()
+def test_sum_usage():
+    u = offload.sum_usage([{"input_tokens": 1, "cache_read_input_tokens": 2, "output_tokens": 3},
+                           {"input_tokens": 4, "output_tokens": None}])
+    assert u == {"input": 5, "cache_read": 2, "output": 3}
 
 
-def test_worker_up_needs_the_model(fake_ollama):
-    assert offload.worker_up(fake_ollama, "have") is True
-    assert offload.worker_up(fake_ollama, "missing") is False
+def test_codex_usage_mapping():
+    m = offload._codex_usage({"input_tokens": 10, "cached_input_tokens": 7, "cache_write_input_tokens": 1,
+                              "output_tokens": 2})
+    assert m == {"input_tokens": 10, "cache_read_input_tokens": 7, "cache_creation_input_tokens": 1,
+                 "output_tokens": 2}
 
 
-def test_run_refuses_a_down_worker_before_any_spend(monkeypatch, tmp_path, capsys):
-    monkeypatch.setattr(offload, "resolve_claude", lambda: {"link": "/x", "real": "/x", "version": "test"})
-    monkeypatch.setattr(offload, "resolve_worker", lambda name: {"base_url": "http://127.0.0.1:1", "model": "m"})
-    prepared = []
-    monkeypatch.setattr(offload, "prepare_run", lambda *a, **k: prepared.append(1))
-    brief = tmp_path / "b.md"
-    brief.write_text("do it")
-    rc = offload.main(["--home", str(tmp_path / "h"), "run", "--repo", str(tmp_path), "--brief", str(brief),
-                       "--worker", "box-a"])
-    assert rc == 2 and "is down" in capsys.readouterr().out and not prepared
+# ------------------------------------------------------------------ stream handlers
+
+class FakeProgress:
+    def __init__(self):
+        self.tools = 0
+    def tool_use(self, n):
+        self.tools += n
+    def usage(self, per_msg, last):
+        pass
 
 
-# ------------------------------------------------------------------ discard
-
-def make_run(ohome, run_dir_in_json, run_id="deadbeef-s"):
-    d = Path(ohome) / "runs" / run_id
-    d.mkdir(parents=True)
-    (d / "run.json").write_text(json.dumps({"run_id": run_id, "run_dir": str(run_dir_in_json), "slug": "s",
-                                            "repo": "/nonexistent", "head_sha": "x"}))
-    return d
-
-
-def test_discard_refuses_path_outside_home(tmp_path):
-    ohome = os.path.realpath(tmp_path / "oh")
-    victim = tmp_path / "victim"
-    victim.mkdir()
-    (victim / "keep").write_text("x")
-    make_run(ohome, victim)
-    with pytest.raises(offload.OffloadError, match="outside"):
-        offload.discard_run(ohome, "deadbeef-s")
-    assert (victim / "keep").exists()
+def test_claude_handler():
+    out = {"saw_init": False, "init_problems": [], "text": "", "result": None}
+    h = offload._claude_handler(out, {}, FakeProgress())
+    assert h(json.dumps({"type": "system", "subtype": "init", "mcp_servers": [],
+                         "permissionMode": "dontAsk", "tools": list(offload.ALLOWED_TOOLS)}).encode()) is False
+    assert out["saw_init"] and out["init_problems"] == []
+    h(json.dumps({"type": "assistant", "message": {"id": "1", "usage": {"input_tokens": 5},
+                  "content": [{"type": "text", "text": "hi"}, {"type": "tool_use"}]}}).encode())
+    assert out["text"] == "hi"
+    h(json.dumps({"type": "result", "result": "final", "num_turns": 3}).encode())
+    assert out["result"]["result"] == "final"
 
 
-def test_discard_rejects_traversal_run_id(tmp_path):
-    with pytest.raises(offload.OffloadError):
-        offload.discard_run(str(tmp_path), "../../etc")
+def test_claude_handler_bad_init_stops():
+    out = {"saw_init": False, "init_problems": [], "text": "", "result": None}
+    h = offload._claude_handler(out, {}, FakeProgress())
+    stop = h(json.dumps({"type": "system", "subtype": "init", "mcp_servers": [{"x": 1}],
+                        "permissionMode": "dontAsk", "tools": list(offload.ALLOWED_TOOLS)}).encode())
+    assert stop is True and out["init_problems"]
 
 
-def test_discard_removes_run_dir(tmp_path):
-    ohome = os.path.realpath(tmp_path / "oh")
-    d = make_run(ohome, os.path.join(ohome, "runs", "deadbeef-s"))
-    out = offload.discard_run(ohome, "deadbeef-s")
-    assert out["status"] == "discarded" and not d.exists()
+def test_codex_handler():
+    out = {"saw_init": False, "text": "", "result": None, "turns": 0}
+    prog = FakeProgress()
+    h = offload._codex_handler(out, {}, prog)
+    h(json.dumps({"type": "thread.started", "thread_id": "x"}).encode())
+    assert out["saw_init"]
+    h(json.dumps({"type": "item.completed", "item": {"type": "command_execution"}}).encode())
+    h(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "done"}}).encode())
+    assert out["text"] == "done" and prog.tools == 1
+    h(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 9, "cached_input_tokens": 1,
+                  "output_tokens": 2}}).encode())
+    assert out["turns"] == 1 and out["result"]
 
 
-def test_discard_never_chmods_through_symlinks(tmp_path):
-    ohome = os.path.realpath(tmp_path / "oh")
-    d = make_run(ohome, os.path.join(ohome, "runs", "deadbeef-s"))
-    outside = tmp_path / "outside.txt"
-    outside.write_text("keep")
-    outside.chmod(0o644)
-    ro = d / "ro"
-    ro.mkdir()
-    (ro / "link").symlink_to(outside)
-    ro.chmod(0o555)  # unlink needs the parent writable, so rmtree calls the error handler
-    out = offload.discard_run(ohome, "deadbeef-s")
-    assert out["status"] == "discarded" and not d.exists()
-    assert outside.exists() and (outside.stat().st_mode & 0o777) == 0o644
+# ------------------------------------------------------------------ tar safety, repo validation
 
-
-def test_extract_rejects_traversal(tmp_path):
+def test_extract_tar_rejects_escape(tmp_path):
     import io
     import tarfile
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tf:
         info = tarfile.TarInfo("../evil")
-        info.size = 1
-        tf.addfile(info, io.BytesIO(b"x"))
+        info.size = 0
+        tf.addfile(info, io.BytesIO(b""))
     buf.seek(0)
+    dest = tmp_path / "dest"
+    dest.mkdir()
     with pytest.raises(offload.OffloadError):
-        offload.extract_tar_safely(buf, str(tmp_path / "dest"))
+        offload.extract_tar_safely(buf, str(dest))
 
 
-# ------------------------------------------------------------------ egress proxy
-
-class FakeUpstream:
-    """An http.server on an ephemeral port that records requests and streams an SSE-like reply."""
-
-    def __init__(self):
-        import http.server
-        import threading
-        self.seen = []
-        self.release = threading.Event()
-        up = self
-
-        class H(http.server.BaseHTTPRequestHandler):
-            protocol_version = "HTTP/1.1"
-
-            def log_message(self, *a):
-                pass
-
-            def _any(self):
-                n = int(self.headers.get("Content-Length", "0"))
-                body = self.rfile.read(n)
-                up.seen.append((self.command, self.path, body, dict(self.headers)))
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("anthropic-ratelimit-x", "1")
-                self.send_header("request-id", "req_1")
-                self.send_header("X-Secret-Header", "nope")
-                self.send_header("Transfer-Encoding", "chunked")
-                self.end_headers()
-                for part in (b"data: one\n\n", b"data: two\n\n"):
-                    self.wfile.write(b"%x\r\n%s\r\n" % (len(part), part))
-                    self.wfile.flush()
-                    if part.endswith(b"one\n\n"):
-                        up.release.wait(10)  # the second chunk waits until the test saw the first
-                self.wfile.write(b"0\r\n\r\n")
-
-            do_GET = do_POST = _any
-
-        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
-        self.port = self.httpd.server_address[1]
-        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
-
-    def close(self):
-        self.release.set()
-        self.httpd.shutdown()
-        self.httpd.server_close()
+def test_validate_repo_refuses_home(tmp_path):
+    with pytest.raises(offload.OffloadError):
+        offload.validate_repo(HOME, str(tmp_path / "oh"))
 
 
-@pytest.fixture
-def proxy_env(tmp_path):
-    up = FakeUpstream()
-    log = tmp_path / "proxy_rejects.log"
-    px = offload.EgressProxy(f"http://127.0.0.1:{up.port}", str(log))
-    port = px.start()
-    yield up, px, port, log
-    px.stop()
-    up.close()
+def test_validate_repo_ok(tmp_path):
+    repo = make_repo(tmp_path)
+    assert offload.validate_repo(str(repo), str(tmp_path / "oh")) == os.path.realpath(str(repo))
 
 
-def http_req(port, method, path, body=None, headers=None):
-    import http.client
-    c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
-    c.request(method, path, body=body, headers=headers or {})
-    return c, c.getresponse()
+# ------------------------------------------------------------------ run.json, load_run
+
+def test_write_and_load_run(tmp_path):
+    ohome = str(tmp_path / "oh")
+    rd = os.path.join(ohome, "runs", "1" * 8 + "-s")
+    os.makedirs(rd)
+    offload.write_run_json(rd, {"run_id": "1" * 8 + "-s", "run_dir": rd, "slug": "s"})
+    assert stat.S_IMODE(os.stat(os.path.join(rd, "run.json")).st_mode) == 0o600
+    rec = offload.load_run(ohome, "1" * 8 + "-s")
+    assert rec["slug"] == "s"
 
 
-def test_proxy_forwards_and_streams_allowed_path(proxy_env):
-    up, px, port, log = proxy_env
-    c, r = http_req(port, "POST", "/v1/messages?beta=true", b'{"a":1}',
-                    {"Content-Type": "application/json", "anthropic-version": "2023-06-01", "X-Api-Key": "ollama",
-                     "X-Evil": "1"})
-    assert r.status == 200
-    assert r.getheader("content-type") == "text/event-stream" and r.getheader("request-id") == "req_1"
-    assert r.getheader("anthropic-ratelimit-x") == "1" and r.getheader("X-Secret-Header") is None
-    # streamed: the first event arrives while the upstream is still holding the second back
-    assert r.read1(100) == b"data: one\n\n"
-    assert not up.release.is_set()
-    up.release.set()
-    assert r.read() == b"data: two\n\n"
-    c.close()
-    method, path, body, hdrs = up.seen[0]
-    assert (method, path, body) == ("POST", "/v1/messages?beta=true", b'{"a":1}')
-    assert hdrs.get("anthropic-version") == "2023-06-01" and "X-Evil" not in hdrs
-    up.release.set()
-    c, r = http_req(port, "POST", "/v1/messages/count_tokens", b"{}")
-    assert r.status == 200 and r.read()
-    c.close()
-    assert not log.exists()
+def test_load_run_rejects_escape(tmp_path):
+    ohome = str(tmp_path / "oh")
+    rd = os.path.join(ohome, "runs", "2" * 8 + "-s")
+    os.makedirs(rd)
+    offload.write_run_json(rd, {"run_id": "2" * 8 + "-s", "run_dir": "/etc", "slug": "s"})
+    with pytest.raises(offload.OffloadError):
+        offload.load_run(ohome, "2" * 8 + "-s")
 
 
-@pytest.mark.parametrize("method,path", [("POST", "/api/pull"), ("GET", "/api/tags"), ("GET", "/v1/messages"),
-                                         ("DELETE", "/api/delete"), ("POST", "/v1/messages/"),
-                                         ("POST", "http://evil.example/v1/messages")])
-def test_proxy_rejects_and_logs_everything_else(proxy_env, method, path):
-    up, px, port, log = proxy_env
-    c, r = http_req(port, method, path, b"{}" if method == "POST" else None)
-    assert r.status == 403
-    c.close()
-    assert up.seen == []
-    line = log.read_text().splitlines()[-1]
-    assert method in line and path in line
+# ------------------------------------------------------------------ cmd_run arg validation
+
+def _args(**kw):
+    base = dict(repo="/x", brief="/b", slug=None, kind="claude", model=None, worker=None,
+                max_turns=60, timeout_min=45, max_thinking_tokens=8000, base_url=None)
+    base.update(kw)
+    return type("A", (), base)
 
 
-def test_proxy_caps_request_body(tmp_path):
-    up = FakeUpstream()
-    up.release.set()
-    px = offload.EgressProxy(f"http://127.0.0.1:{up.port}", str(tmp_path / "rej.log"), max_body=1000)
-    port = px.start()
-    try:
-        c, r = http_req(port, "POST", "/v1/messages", b"x" * 1001)
-        assert r.status == 413
-        c.close()
-        assert up.seen == [] and "too large" in (tmp_path / "rej.log").read_text()
-        c, r = http_req(port, "POST", "/v1/messages", b"x" * 1000)
-        assert r.status == 200
-        c.close()
-    finally:
-        px.stop()
-        up.close()
-    assert offload.PROXY_MAX_BODY == 32 * 1024 * 1024
+def test_cmd_run_codex_rejects_worker(tmp_path, monkeypatch):
+    brief = tmp_path / "b.md"
+    brief.write_text("do it")
+    monkeypatch.setattr(offload, "resolve_codex", lambda: {"kind": "codex", "real": "/x"})
+    with pytest.raises(offload.OffloadError, match="don't pass --worker"):
+        offload.cmd_run(_args(kind="codex", brief=str(brief), worker="gpu-1"), str(tmp_path / "oh"))
 
 
-def test_proxy_stops_listening(tmp_path):
-    px = offload.EgressProxy("http://127.0.0.1:9", str(tmp_path / "l"))
-    port = px.start()
-    px.stop()
-    import socket
-    with pytest.raises(OSError):
-        socket.create_connection(("127.0.0.1", port), timeout=2)
+# ------------------------------------------------------------------ integration with a fake worker
+
+FAKE_CLAUDE = r"""#!/usr/bin/env python3
+import json, sys
+sys.stdin.read()
+open("new_feature.py", "w").write("x = 1\n")
+def e(o): print(json.dumps(o), flush=True)
+e({"type": "system", "subtype": "init", "mcp_servers": [], "permissionMode": "dontAsk",
+   "tools": ["Bash", "Read", "Edit", "Write", "Glob", "Grep"]})
+e({"type": "assistant", "message": {"id": "1", "usage": {"input_tokens": 10, "output_tokens": 4},
+   "content": [{"type": "tool_use"}, {"type": "text", "text": "added it"}]}})
+e({"type": "result", "result": "added it", "num_turns": 2, "usage": {"input_tokens": 10, "output_tokens": 4}})
+"""
+
+FAKE_CODEX = r"""#!/usr/bin/env python3
+import json, sys
+sys.stdin.read()
+out = sys.argv[sys.argv.index("-o") + 1]
+open("new_feature.py", "w").write("x = 1\n")
+open(out, "w").write("added it (codex)")
+def e(o): print(json.dumps(o), flush=True)
+e({"type": "thread.started", "thread_id": "t"})
+e({"type": "item.completed", "item": {"type": "file_change"}})
+e({"type": "item.completed", "item": {"type": "agent_message", "text": "added it (codex)"}})
+e({"type": "turn.completed", "usage": {"input_tokens": 10, "cached_input_tokens": 2, "output_tokens": 4}})
+"""
 
 
-# ------------------------------------------------------------------ pump, survivors
-
-def test_pump_does_not_hang_on_inherited_pipe():
-    """A daemonized child keeps the pipe open after the main process exits: no EOF ever comes."""
-    p = subprocess.Popen(["/bin/sh", "-c", "(sleep 30 &) ; echo hi"], stdout=subprocess.PIPE, start_new_session=True)
-    got = bytearray()
-    t0 = __import__("time").monotonic()
-    try:
-        timed_out = offload.pump(p, 20, got.extend)
-        assert not timed_out and bytes(got) == b"hi\n"
-        assert __import__("time").monotonic() - t0 < 10
-    finally:
-        offload.kill_group(p)
-        p.stdout.close()
-        p.wait()
+def _fake_bin(tmp_path, name, body):
+    p = tmp_path / name
+    p.write_text(body)
+    p.chmod(0o755)
+    return {"kind": name.split("_")[-1], "link": str(p), "real": str(p), "version": "fake"}
 
 
-def test_pump_hard_deadline():
-    p = subprocess.Popen(["/bin/sh", "-c", "while :; do sleep 1; done"], stdout=subprocess.PIPE, start_new_session=True)
-    try:
-        assert offload.pump(p, 1, lambda c: None) is True
-    finally:
-        offload.kill_group(p)
-        p.stdout.close()
-        p.wait()
-
-
-def test_sweep_kills_daemonized_survivor_by_cwd(tmp_path):
-    run = tmp_path / "run"
-    (run / "src").mkdir(parents=True)
-    # the survivor leaves the process group (setsid) and is reparented, so only its cwd ties it to the run
-    p = subprocess.Popen(["/bin/sh", "-c", "cd \"$1\" && (/usr/bin/python3 -c 'import os,time; os.setsid(); time.sleep(60)' >/dev/null 2>&1 &) ; echo $$",
-                          "sh", str(run / "src")], stdout=subprocess.PIPE, start_new_session=True)
-    p.stdout.read()
-    p.wait()
-    import time
-    time.sleep(1)
-    killed = offload.sweep_survivors(p, str(run))
-    p.stdout.close()
-    assert killed, "the survivor was not found"
-    time.sleep(0.3)
-    for pid in killed:
-        with pytest.raises(ProcessLookupError):
-            os.kill(pid, 0)
-
-
-# ------------------------------------------------------------------ integration
-
-def git(repo, *args, env_extra=None):
-    env = {"PATH": offload.SAFE_PATH, "HOME": str(repo), "GIT_CONFIG_GLOBAL": "/dev/null",
-           "GIT_CONFIG_NOSYSTEM": "1", "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
-           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t", **(env_extra or {})}
-    return subprocess.run(["git", "-C", str(repo), *args], env=env, check=True, capture_output=True, text=True).stdout
-
-
-@pytest.fixture
-def repo(tmp_path):
-    r = tmp_path / "repo"
-    r.mkdir()
-    git(r, "init", "-q", "-b", "main")
-    (r / "hello.txt").write_text("hello\n")
-    (r / "src").mkdir()
-    (r / "src" / "app.py").write_text("print('hi')\n")
-    git(r, "add", "-A")
-    git(r, "commit", "-q", "-m", "init")
-    return r
-
-
-def prepare(tmp_path, repo, slug="job"):
-    ohome = os.path.realpath(tmp_path / "ohome")
-    claude = fake_claude()
-    ctx = offload.prepare_run(str(repo), slug, ohome, claude=claude)
-    return ohome, ctx
-
-
-@needs_sandbox
-def test_integration_selftest_passes_and_isolation(tmp_path, repo):
-    _, ctx = prepare(tmp_path, repo)
-    up = FakeUpstream()
-    px = offload.EgressProxy(f"http://127.0.0.1:{up.port}", os.path.join(ctx["run_dir"], "proxy_rejects.log"))
-    try:
-        ctx["proxy_port"] = px.start()
-        ctx["host_ports"] = [up.port]  # a real host listener, as the netstat snapshot would report it
-        offload.write_profile(ctx, ctx["proxy_port"])
-        ok, results = offload.run_selftest(ctx, online=False)
-        assert ok, results
-        names = " | ".join(r["check"] for r in results)
-        for needle in ("proxy answers 403", "binding the proxy port is denied", "binding a snapshotted host port is denied",
-                       "new file in /private/tmp", "existing /private/tmp entry", "/private/tmp/.git/x", "<T>xcrun_db",
-                       "fresh localhost port works", "UDP send to localhost", "proxy port is reachable", "pbpaste", "DNS lookup",
-                       "CONNECT pypi.org:443", "absolute-form GET", "PUT /r/npm/x", "/r/pypi/../../x",
-                       "/r/nope/", "(pypi not enabled)", "33rd concurrent"):
-            assert needle in names, names
-        ctx["registries"] = ["pypi"]
-        ok, results = offload.run_selftest(ctx, online=False)
-        names = " | ".join(r["check"] for r in results)
-        assert ok and "(offline, skipped)" in names and "not enabled" not in names and "/r/nope/" in names
-        assert up.seen == []
-        assert "/api/pull" in (Path(ctx["run_dir"]) / "proxy_rejects.log").read_text()
-    finally:
-        px.stop()
-        up.close()
-    assert (Path(ctx["src"]) / "hello.txt").read_text() == "hello\n"
-    assert not [p for p in Path(ctx["src"]).iterdir() if p.name.startswith(".probe")]
-    assert not [p for p in repo.iterdir() if p.name.startswith(".offload-probe")]
-    sb = lambda *a: subprocess.run(["/usr/bin/sandbox-exec", "-f", ctx["profile"], *a], capture_output=True, text=True)
-    assert sb("/bin/cat", str(repo / "hello.txt")).returncode != 0
-    ok_read = sb("/bin/cat", os.path.join(ctx["src"], "src", "app.py"))
-    assert ok_read.returncode == 0 and "print" in ok_read.stdout
-    assert sb("/bin/cat", os.path.join(ctx["git_dir"], "HEAD")).returncode != 0
-    assert sb("/bin/cat", os.path.join(ctx["run_dir"], "run.json")).returncode != 0
-    assert sb("/bin/ls", ctx["run_dir"]).returncode != 0
-
-
-@needs_sandbox
-def test_integration_no_unix_sockets_and_proxy_only(tmp_path, repo):
-    _, ctx = prepare(tmp_path, repo)
-    up = FakeUpstream()
-    up.release.set()
-    px = offload.EgressProxy(f"http://127.0.0.1:{up.port}", os.path.join(ctx["run_dir"], "proxy_rejects.log"))
-    try:
-        ctx["proxy_port"] = px.start()
-        offload.write_profile(ctx, ctx["proxy_port"])
-        sb = lambda *a: subprocess.run(["/usr/bin/sandbox-exec", "-f", ctx["profile"], *a], cwd=ctx["src"],
-                                       capture_output=True, text=True, timeout=30)
-        # a unix socket that the worker could otherwise reach (relative path, so the length is fine)
-        import socket
-        srv = socket.socket(socket.AF_UNIX)
-        here = os.getcwd()
-        os.chdir(ctx["src"])
-        try:
-            srv.bind("s.sock")
-        finally:
-            os.chdir(here)
-        srv.listen(1)
-        code = "import socket; s=socket.socket(socket.AF_UNIX); s.connect('s.sock')"
-        control = subprocess.run(["/usr/bin/python3", "-c", code], cwd=ctx["src"], capture_output=True)
-        assert control.returncode == 0, control.stderr
-        denied = sb("/usr/bin/python3", "-c", code)
-        assert denied.returncode != 0 and "not permitted" in denied.stderr.lower(), denied.stderr
-        srv.close()
-        # the proxy is reachable, and so is any other host listener (user decision 2026-10-29)
-        ok_port = sb("/usr/bin/curl", "-s", "-m", "3", "-o", "/dev/null", "-w", "%{http_code}", "-X", "POST",
-                     f"http://127.0.0.1:{ctx['proxy_port']}/v1/messages", "-d", "{}")
-        assert ok_port.stdout == "200", ok_port
-        direct = sb("/usr/bin/curl", "-s", "-m", "3", "-o", "/dev/null", "-w", "%{http_code}",
-                    f"http://127.0.0.1:{up.port}/")
-        assert direct.returncode == 0 and direct.stdout != "000"
-    finally:
-        px.stop()
-        up.close()
-
-
-@needs_sandbox
-def test_integration_test_cmd_runs_committed_code_without_network(tmp_path, repo, capsys):
-    ohome, ctx = prepare(tmp_path, repo)
-    (Path(ctx["src"]) / "committed.txt").write_text("in the commit\n")
+def _run_flow(tmp_path, kind, worker_bin, model, base):
+    repo = make_repo(tmp_path)
+    ohome = str(tmp_path / "oh")
+    ctx = offload.prepare_run(str(repo), "feat", ohome, kind, worker_bin, model, base)
+    offload.init_worker_git(ctx)
+    out = offload.launch_worker(ctx, "build it", timeout_s=60)
     head = offload.commit_work(ctx)
     offload.fetch_work(ctx)
-    ctx["record"].update(head_sha=head, status="ok")
-    offload.write_run_json(ctx["run_dir"], ctx["record"])
-    # written after the commit: must not be visible to `test`
-    (Path(ctx["src"]) / "late.txt").write_text("late\n")
-    cmd = ["/bin/sh", "-c", "cat committed.txt; test ! -e late.txt && echo no-late; pwd >&2; "
-                            "curl -s -m 2 http://127.0.0.1:11434/ ; echo curl=$?"]
-    assert offload.main(["--home", ohome, "test", "--run", ctx["run_id"], "--", *cmd]) == 0
-    out = json.loads(capsys.readouterr().out)
-    assert out["status"] == "ok" and "in the commit" in out["untrusted_output"] and "no-late" in out["untrusted_output"]
-    assert "curl=7" in out["untrusted_output"]
-    assert "testsrc-1" in out["untrusted_output"]
-    assert not list(Path(ctx["run_dir"]).glob("testsrc-*")) and not list(Path(ctx["run_dir"]).glob("profile-test-*"))
-    assert (Path(ctx["src"]) / "late.txt").exists()
+    ctx["base_sha"] = ctx["record"]["base_sha"]
+    stat_out, paths = offload.diff_summary(ctx)
+    return repo, ohome, ctx, out, head, stat_out, paths
 
 
-@needs_sandbox
-def test_integration_test_cmd_survives_daemonizing_and_floods(tmp_path, repo, capsys):
-    ohome, ctx = prepare(tmp_path, repo)
-    head = offload.commit_work(ctx)
-    offload.fetch_work(ctx)
-    ctx["record"].update(head_sha=head, status="ok")
-    offload.write_run_json(ctx["run_dir"], ctx["record"])
-    cmd = ["/bin/sh", "-c", "(sleep 60 &); head -c 300000 /dev/zero | tr '\\0' 'x'; echo END"]
-    t0 = __import__("time").monotonic()
-    assert offload.main(["--home", ohome, "test", "--run", ctx["run_id"], "--timeout-s", "30", "--", *cmd]) == 0
-    assert __import__("time").monotonic() - t0 < 25
-    out = json.loads(capsys.readouterr().out)
-    assert out["status"] == "ok" and out["total_output_bytes"] >= 300000 and "END" in out["untrusted_output"]
-    assert out["survivors_killed"]
-    assert json.loads((Path(ctx["run_dir"]) / "run.json").read_text())["survivors_killed"] == out["survivors_killed"]
-
-
-@needs_sandbox
-def test_integration_commit_fetch_verify(tmp_path, repo):
-    _, ctx = prepare(tmp_path, repo)
-    before = git(repo, "for-each-ref", "--format=%(refname) %(objectname)")
-    (Path(ctx["src"]) / "new_feature.py").write_text("x = 1\n")
-    head = offload.commit_work(ctx)
-    offload.fetch_work(ctx)
+def test_integration_claude(tmp_path):
+    wb = _fake_bin(tmp_path, "fake_claude", FAKE_CLAUDE)
+    repo, ohome, ctx, out, head, stat_out, paths = _run_flow(
+        tmp_path, "claude", wb, "kimi-k3:cloud", {"url": offload.DEFAULT_BASE_URL})
+    assert out["saw_init"] and out["init_problems"] == []
+    assert out["text"] == "added it" and out["usage"]["output"] == 4
+    assert "new_feature.py" in paths
+    # branch landed in the real repo, nothing else moved
+    assert offload.ref_exists(str(repo), "refs/heads/offload/feat", "/var/empty")
     assert offload.verify_refs(ctx) == []
-    assert git(repo, "rev-parse", "refs/heads/offload/job").strip() == head
-    after = git(repo, "for-each-ref", "--format=%(refname) %(objectname)")
-    changed = set(after.splitlines()) ^ set(before.splitlines())
-    assert {ln.split()[0] for ln in changed} == {"refs/heads/offload/job"}
-    assert "new_feature.py" in git(repo, "show", "--stat", "--format=", "refs/heads/offload/job")
-    assert git(repo, "for-each-ref", "refs/offload-tmp").strip() == ""
-    # a second fetch must refuse to overwrite
-    with pytest.raises(offload.OffloadError, match="already exists"):
-        offload.fetch_work(ctx)
-    assert git(repo, "rev-parse", "refs/heads/offload/job").strip() == head
+    assert offload.estimate_cost("kimi-k3:cloud", out["usage"]) is not None
 
 
-@needs_sandbox
-def test_integration_update_ref_is_create_only_and_tmp_ref_cleaned(tmp_path, repo):
-    _, ctx = prepare(tmp_path, repo)
-    head = offload.commit_work(ctx)
-    # lose the race: the branch appears after the pre-check but before update-ref
-    real = offload.check_branch_free
-    def racing(*a, **k):
-        real(*a, **k)
-        git(repo, "branch", "offload/job", "main")
-    offload.check_branch_free = racing
-    try:
-        with pytest.raises(offload.OffloadError):
-            offload.fetch_work(ctx)
-    finally:
-        offload.check_branch_free = real
-    assert git(repo, "rev-parse", "refs/heads/offload/job").strip() == git(repo, "rev-parse", "main").strip() != head
-    assert git(repo, "for-each-ref", "refs/offload-tmp").strip() == ""
+def test_integration_codex(tmp_path):
+    wb = _fake_bin(tmp_path, "fake_codex", FAKE_CODEX)
+    repo, ohome, ctx, out, head, stat_out, paths = _run_flow(tmp_path, "codex", wb, None, None)
+    assert out["saw_init"] and out["turns"] == 1
+    assert out["text"] == "added it (codex)"  # read from the -o last-message file
+    assert out["usage"] == {"input": 10, "cache_read": 2, "output": 4}
+    assert "new_feature.py" in paths
+    assert offload.ref_exists(str(repo), "refs/heads/offload/feat", "/var/empty")
+    assert offload.estimate_cost(None, out["usage"]) is None  # codex: no per-token estimate
 
 
-@needs_sandbox
-@pytest.mark.parametrize("existing", ["offload", "offload/job", "offload/job/x"])
-def test_integration_prepare_refuses_branch_collisions_before_any_spend(tmp_path, repo, existing):
-    git(repo, "branch", existing, "main")
-    ohome = os.path.realpath(tmp_path / "ohome")
-    with pytest.raises(offload.OffloadError, match="already exists|under it"):
-        offload.prepare_run(str(repo), "job", ohome, claude=fake_claude())
-    assert not os.path.exists(os.path.join(ohome, "runs"))
-
-
-@needs_sandbox
-def test_integration_ref_violation_inside_the_fetch_window(tmp_path, repo):
-    _, ctx = prepare(tmp_path, repo)
-    offload.commit_work(ctx)
-    real = offload.safe_git
-    def meddling(args, home, *a, **k):
-        p = real(args, home, *a, **k)
-        if "update-ref" in args and "refs/heads/offload/job" in args:
-            git(repo, "branch", "sneaky", "main")
-        return p
-    offload.safe_git = meddling
-    try:
-        offload.fetch_work(ctx)
-    finally:
-        offload.safe_git = real
-    assert [v["ref"] for v in offload.verify_refs(ctx)] == ["refs/heads/sneaky"]
-
-
-@needs_sandbox
-def test_integration_hooks_do_not_run(tmp_path, repo):
-    marker = tmp_path / "hook-ran"
-    hooks = repo / ".husky"
-    hooks.mkdir()
-    for name in ("pre-commit", "reference-transaction", "post-checkout", "post-commit", "commit-msg"):
-        h = hooks / name
-        h.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 0\n")
-        h.chmod(0o755)
-    git(repo, "add", "-A")
-    git(repo, "commit", "-q", "--no-verify", "-m", "hooks")
-    git(repo, "config", "core.hooksPath", ".husky")
-    # control: the hook really fires when git is run unsafely in this repo
-    git(repo, "update-ref", "refs/heads/control", "HEAD")
-    assert marker.exists(), "test setup is wrong: the hook did not fire"
-    marker.unlink()
-    git(repo, "update-ref", "-d", "refs/heads/control")
-    marker.unlink(missing_ok=True)
-    _, ctx = prepare(tmp_path, repo)
-    (Path(ctx["src"]) / "x.py").write_text("y = 2\n")
-    offload.commit_work(ctx)
-    offload.fetch_work(ctx)
-    assert offload.verify_refs(ctx) == []
-    assert not marker.exists()
-
-
-@needs_sandbox
-def test_integration_cli_list_status_diff_discard(tmp_path, repo, capsys):
-    ohome, ctx = prepare(tmp_path, repo)
-    (Path(ctx["src"]) / "added.sh").write_text("echo hi\n")
-    head = offload.commit_work(ctx)
-    offload.fetch_work(ctx)
-    ctx["record"].update(head_sha=head, status="ok")
-    offload.write_run_json(ctx["run_dir"], ctx["record"])
-    assert offload.main(["--home", ohome, "list"]) == 0
-    assert ctx["run_id"] in capsys.readouterr().out
-    assert offload.main(["--home", ohome, "diff", "--run", ctx["run_id"]]) == 0
-    out = capsys.readouterr().out
-    assert "added.sh" in out and '"untrusted_sensitive_paths"' in out
-    assert "added.sh" in out.split('"untrusted_sensitive_paths"')[1]
-    trailer = json.loads(out[out.index("\n{") + 1:])
-    assert trailer["truncated"] is False and trailer["format_chars"] == 0
-    assert trailer["untrusted_numstat"] == [{"path": "added.sh", "added": 1, "deleted": 0}]
-    assert offload.main(["--home", ohome, "diff", "--run", ctx["run_id"], "--", "hello.txt"]) == 0
-    out = capsys.readouterr().out
-    assert "added.sh" not in out.split("\n{")[0] and "added.sh" in out.split("\n{")[1]
-    assert offload.main(["--home", ohome, "discard", "--run", ctx["run_id"]]) == 0
+def test_integration_test_and_discard(tmp_path):
+    wb = _fake_bin(tmp_path, "fake_codex", FAKE_CODEX)
+    repo, ohome, ctx, out, head, stat_out, paths = _run_flow(tmp_path, "codex", wb, None, None)
+    # `test` runs the committed code in a throwaway checkout
+    targs = type("A", (), {"run": ctx["run_id"], "timeout_s": 30,
+                           "test_cmd": ["--", sys.executable, "-c", "import new_feature; print(new_feature.x)"]})
+    offload.cmd_test(targs, ohome)
+    # record head_sha as cmd_run would, so discard can match and delete the branch
+    rec = offload.load_run(ohome, ctx["run_id"])
+    rec["head_sha"] = head
+    offload.write_run_json(ctx["run_dir"], rec)
+    # discard removes the run and the branch
+    res = offload.discard_run(ohome, ctx["run_id"])
+    assert res["branch_deleted"] is True
     assert not os.path.exists(ctx["run_dir"])
-    assert subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "-q", "refs/heads/offload/job"],
-                          capture_output=True).returncode != 0
-
-
-@needs_sandbox
-def test_integration_diff_truncation_flag_and_path_filter(tmp_path, repo, capsys):
-    ohome, ctx = prepare(tmp_path, repo)
-    (Path(ctx["src"]) / "big.txt").write_text("line\n" * 60000)
-    (Path(ctx["src"]) / "small.txt").write_text("zero\u200bwidth\n")
-    head = offload.commit_work(ctx)
-    offload.fetch_work(ctx)
-    ctx["record"].update(head_sha=head, status="ok")
-    offload.write_run_json(ctx["run_dir"], ctx["record"])
-    assert offload.main(["--home", ohome, "diff", "--run", ctx["run_id"]]) == 0
-    out = capsys.readouterr().out
-    trailer = json.loads(out[out.rindex("\n{") + 1:])
-    assert trailer["truncated"] is True and trailer["format_chars"] == 1
-    assert {r["path"] for r in trailer["untrusted_numstat"]} == {"big.txt", "small.txt"}
-    assert offload.main(["--home", ohome, "diff", "--run", ctx["run_id"], "--", "small.txt"]) == 0
-    out = capsys.readouterr().out
-    trailer = json.loads(out[out.rindex("\n{") + 1:])
-    assert trailer["truncated"] is False and "zero⟨U+200B⟩width" in out and trailer["paths_filter"] == ["small.txt"]
-
-
-@needs_sandbox
-def test_integration_errors_are_recorded_in_run_json(tmp_path, repo, monkeypatch):
-    ohome, ctx = prepare(tmp_path, repo)
-    brief = tmp_path / "brief.md"
-    brief.write_text("do it\n")
-    # exercise cmd_run's error path with a fake worker that succeeds and a fetch that fails
-    monkeypatch.setattr(offload, "resolve_claude", lambda allow=False: fake_claude())
-    monkeypatch.setattr(offload, "launch_worker", lambda *a, **k: {
-        "init_problems": [], "saw_init": True, "timed_out": False, "result": {"is_error": False}, "usage": {},
-        "text": "", "returncode": 0, "turns": 1, "survivors_killed": []})
-    monkeypatch.setattr(offload, "run_selftest", lambda c: (True, []))
-    def boom(c):
-        raise offload.OffloadError("fetch exploded")
-    monkeypatch.setattr(offload, "fetch_work", boom)
-    shutil.rmtree(ctx["run_dir"])
-    assert offload.main(["--home", ohome, "run", "--repo", str(repo), "--brief", str(brief), "--slug", "job"]) == 2
-    rec = json.loads((Path(ohome) / "runs" / ctx["run_id"] / "run.json").read_text())
-    assert rec["status"] == "error" and "fetch exploded" in rec["error"] and len(rec["head_sha"]) == 40
-
-
-# ------------------------------------------------------------------ run.json live state
-
-def _assistant(n_tools, mid="m"):
-    blocks = [{"type": "tool_use", "id": f"t{i}", "name": "Bash", "input": {}} for i in range(n_tools)]
-    return json.dumps({"type": "assistant", "message": {"id": mid, "content": blocks or [{"type": "text", "text": "hi"}]}})
-
-
-def _read_run_json(d):
-    with open(os.path.join(d, "run.json")) as f:
-        return json.load(f)
-
-
-def test_write_run_json_atomic_and_private(tmp_path):
-    offload.write_run_json(str(tmp_path), {"status": "prepared", "n": 1})
-    offload.write_run_json(str(tmp_path), {"status": "running", "n": 2})
-    assert os.listdir(tmp_path) == ["run.json"]  # temp file is gone
-    assert _read_run_json(tmp_path) == {"status": "running", "n": 2}
-    assert os.stat(tmp_path / "run.json").st_mode & 0o777 == 0o600
-
-
-def test_write_run_json_failure_leaves_old_file_and_no_tmp(tmp_path):
-    offload.write_run_json(str(tmp_path), {"ok": 1})
-    with pytest.raises(TypeError):
-        offload.write_run_json(str(tmp_path), {"bad": object()})
-    assert os.listdir(tmp_path) == ["run.json"] and _read_run_json(tmp_path) == {"ok": 1}
-
-
-def test_progress_counts_and_throttles(tmp_path):
-    now = [100.0]
-    rec = {"status": "running"}
-    p = offload.Progress(str(tmp_path), rec, interval=2.0, clock=lambda: now[0])
-    p.tool_use(2)
-    assert _read_run_json(tmp_path)["tool_calls"] == 2
-    now[0] = 101.0
-    p.tool_use(1)  # inside the window: in-memory only
-    assert rec["tool_calls"] == 3 and _read_run_json(tmp_path)["tool_calls"] == 2
-    now[0] = 102.5
-    p.tool_use(1)
-    on_disk = _read_run_json(tmp_path)
-    assert on_disk["tool_calls"] == 4 and on_disk["last_activity_at"] > 0
-
-
-def test_progress_writes_live_usage_and_context(tmp_path):
-    rec = {"status": "running"}
-    p = offload.Progress(str(tmp_path), rec, interval=0)
-    m1 = {"input_tokens": 1040, "cache_read_input_tokens": None, "output_tokens": 50}
-    m2 = {"input_tokens": 300, "cache_read_input_tokens": 1800, "cache_creation_input_tokens": 80, "output_tokens": 70}
-    p.usage([m1], m1)
-    assert _read_run_json(tmp_path)["context_tokens"] == 1040
-    p.usage([m1, m2], m2)
-    on_disk = _read_run_json(tmp_path)
-    assert on_disk["usage"] == {"input": 1340, "cache_read": 1800, "output": 120}
-    assert on_disk["context_tokens"] == 300 + 1800 + 80
-
-
-def test_sum_usage_treats_null_as_zero():
-    assert offload.sum_usage([{"input_tokens": None, "output_tokens": 3}, {}]) == {"input": 0, "cache_read": 0, "output": 3}
-
-
-def _fake_launch(monkeypatch, tmp_path, lines):
-    script = tmp_path / "fake.sh"
-    script.write_text("#!/bin/sh\ncat >/dev/null\n" + "".join(f"printf '%s\\n' '{ln}'\n" for ln in lines))
-    script.chmod(0o755)
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
-    (tmp_path / "src").mkdir()
-    monkeypatch.setattr(offload, "sandbox_argv", lambda profile, argv: [str(script)])
-    monkeypatch.setattr(offload, "worker_url", lambda ctx: "http://127.0.0.1:1")
-    monkeypatch.setattr(offload, "sweep_survivors", lambda proc, rd: [])
-    monkeypatch.setattr(offload, "check_init", lambda ev: [])
-    rec = {"status": "prepared"}
-    offload.write_run_json(str(run_dir), rec)
-    ctx = {"run_dir": str(run_dir), "model": "m", "max_thinking": 1000, "profile": "p", "src": str(tmp_path / "src"),
-           "claude": {"real": "/usr/bin/true"}, "max_turns": 1, "record": rec}
-    return ctx, run_dir
-
-
-def test_launch_worker_status_running_and_tool_calls(monkeypatch, tmp_path):
-    init = json.dumps({"type": "system", "subtype": "init"})
-    res = json.dumps({"type": "result", "num_turns": 2, "result": "done", "usage": {}})
-    ctx, run_dir = _fake_launch(monkeypatch, tmp_path, [init, _assistant(2, "a"), _assistant(0, "b"), _assistant(1, "c"), res])
-    seen = []
-    real_popen = subprocess.Popen
-
-    def spy(*a, **kw):
-        seen.append(dict(_read_run_json(run_dir)))  # run.json as of just before the worker starts
-        return real_popen(*a, **kw)
-
-    monkeypatch.setattr(offload.subprocess, "Popen", spy)
-    assert _read_run_json(run_dir)["status"] == "prepared"
-    w = offload.launch_worker(ctx, "brief", 30)
-    assert w["saw_init"] and w["turns"] == 2
-    assert seen[-1]["status"] == "running" and isinstance(seen[-1]["started_at"], float)
-    assert ctx["record"]["tool_calls"] == 3  # text-only message not counted
-    assert ctx["record"]["last_activity_at"] >= seen[-1]["started_at"]
-    assert _read_run_json(run_dir)["tool_calls"] >= 1  # at least the first (unthrottled) write landed
-    assert [f for f in os.listdir(run_dir) if f.startswith("run.json")] == ["run.json"]
-
-
-# ================================================================== v0.3: working like Claude
-
-import http.client  # noqa: E402
-import http.server  # noqa: E402
-import socket  # noqa: E402
-import threading  # noqa: E402
-import time  # noqa: E402
-
-
-# ------------------------------------------------------------------ worker env, PATH, preamble, turns
-
-def test_defaults_v03():
-    assert offload.DEFAULT_MAX_TURNS == 60
-    assert offload.build_parser().parse_args(["run", "--repo", "r", "--brief", "b"]).max_turns == 60
-    assert offload.DEFAULT_READ_HOME == (".rustup",)
-    assert offload.WORKER_PREAMBLE == (
-        "You are working in a copy of the repo, in the current directory. git works locally: there is no remote. "
-        "There is no network except the model. Make temp files with `mktemp -d \"$TMPDIR/x.XXXXXX\"`. Write the "
-        "code and tests the brief asks for, run the tests, commit if you like, and finish with a short summary.\n\n")
-
-
-def test_clt_first_on_worker_path_only_when_root_owned(monkeypatch, tmp_path):
-    monkeypatch.setattr(offload, "CLT_BIN", "/usr/bin")  # exists and is root-owned
-    env = offload.build_worker_env("/r", "m", "http://127.0.0.1:1")
-    assert env["PATH"].split(":")[:3] == ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"]
-    assert env["PYTHONDONTWRITEBYTECODE"] == "1"
-    monkeypatch.setattr(offload, "CLT_BIN", str(tmp_path))  # exists, owned by the test user
-    assert str(tmp_path) not in offload.build_worker_env("/r", "m", "http://127.0.0.1:1")["PATH"]
-    monkeypatch.setattr(offload, "CLT_BIN", str(tmp_path / "missing"))
-    path = offload.build_worker_env("/r", "m", "http://127.0.0.1:1")["PATH"].split(":")
-    assert sorted(path) == sorted(offload.SAFE_PATH.split(":")) and path[:2] == ["/opt/homebrew/bin", "/usr/local/bin"]
-    # the helper's own git keeps SAFE_PATH
-    assert f"PATH={offload.SAFE_PATH}" in offload.safe_git_argv(["status"], "/h", git_bin="/usr/bin/git")
-
-
-def test_clt_constant_is_hardcoded():
-    src = Path(offload.__file__).read_text()
-    assert "xcode-select" not in src.replace("never taken from `xcode-select -p`", "")
-    assert "/Library/Developer/CommandLineTools/usr/bin" in src
-
-
-def test_registry_env_points_at_proxy():
-    env = offload.build_worker_env("/r", "m", "http://127.0.0.1:5555", registries=("pypi", "npm"))
-    assert env["PIP_INDEX_URL"] == "http://127.0.0.1:5555/r/pypi/simple" and env["PIP_TRUSTED_HOST"] == "127.0.0.1"
-    assert env["UV_DEFAULT_INDEX"] == "http://127.0.0.1:5555/r/pypi/simple" and env["UV_INSECURE_HOST"] == "127.0.0.1"
-    assert env["NPM_CONFIG_REGISTRY"] == "http://127.0.0.1:5555/r/npm/"
-    assert env["CARGO_HOME"] == "/r/home/.cargo"
-    assert (env["GOPROXY"], env["GOFLAGS"], env["GOSUMDB"], env["GOCACHE"]) == ("off", "-mod=mod", "off", "/r/tmp/gocache")
-    assert "GOMODCACHE" not in env and "CARGO_NET_OFFLINE" not in env
-    assert not [k for k in env if k.upper() in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY")]
-    assert "HTTPS_PROXY" not in Path(offload.__file__).read_text()
-
-
-def test_gomodcache_only_when_allowed(tmp_path):
-    mod = os.path.realpath(os.path.join(HOME, "go", "pkg", "mod"))
-    env = offload.build_worker_env("/r", "m", "http://127.0.0.1:1", allow_read=[mod])
-    assert env["GOMODCACHE"] == mod
-    other = offload.build_worker_env("/r", "m", "http://127.0.0.1:1", allow_read=[str(tmp_path)])
-    assert "GOMODCACHE" not in other
-
-
-def test_write_registry_configs(tmp_path):
-    offload.write_registry_configs(str(tmp_path), "http://127.0.0.1:5555", ("crates", "maven"))
-    cargo = (tmp_path / "home" / ".cargo" / "config.toml").read_text()
-    assert 'replace-with = "offload"' in cargo and 'registry = "sparse+http://127.0.0.1:5555/r/crates-index/"' in cargo
-    mvn = (tmp_path / "home" / ".m2" / "settings.xml").read_text()
-    assert "<mirrorOf>*</mirrorOf>" in mvn and "<url>http://127.0.0.1:5555/r/maven/</url>" in mvn
-
-
-@needs_sandbox
-@pytest.mark.skipif(not os.path.isdir(offload.CLT_BIN), reason="needs the Command Line Tools")
-def test_integration_worker_shell_python_git_and_temp(tmp_path, repo):
-    _, ctx = prepare(tmp_path, repo)
-    env = offload.build_worker_env(ctx["run_dir"], "m", "http://127.0.0.1:1")
-    offload.write_profile(ctx)
-
-    def sb(*argv):
-        return subprocess.run(["/usr/bin/sandbox-exec", "-f", ctx["profile"], *argv], cwd=ctx["src"], env=env,
-                              capture_output=True, text=True, timeout=60)
-    r = sb("/bin/zsh", "-c", "cat <<EOF\nheredoc ok\nEOF")
-    assert r.returncode == 0 and "heredoc ok" in r.stdout, r.stderr
-    r = sb("/bin/sh", "-c", 'mktemp -d "$TMPDIR/x.XXXXXX"')
-    assert r.returncode == 0 and r.stdout.strip().startswith(os.path.join(ctx["run_dir"], "tmp") + "/x."), r.stderr
-    r = sb("/bin/sh", "-c", "command -v python3 git; python3 -c 'import tempfile; print(tempfile.mkdtemp())'")
-    assert r.returncode == 0 and "/usr/bin/python3" not in r.stdout and "xcrun" not in r.stderr, r.stderr
-    offload.init_worker_git(ctx)
-    r = sb("/bin/sh", "-c", "git status --short; git log --format=%s; echo x > n.txt; git add n.txt; "
-                            "git commit -qm worker && git log --format=%s")
-    assert r.returncode == 0 and "base" in r.stdout and "worker" in r.stdout and "xcrun" not in r.stderr, r.stderr
-
-
-# ------------------------------------------------------------------ default read roots
-
-def test_default_read_roots_skip_with_warning(tmp_path):
-    home, outside = tmp_path / "h", tmp_path / "outside"
-    for d in (home, outside, home / ".rustup"):
-        d.mkdir(parents=True)
-    (home / ".cargo").mkdir()
-    roots, warnings = offload.default_read_roots(home=str(home))
-    assert roots == [os.path.realpath(home / ".rustup")] and warnings == []
-    (home / ".rustup").rmdir()
-    (home / ".rustup").symlink_to(outside)  # leaves $HOME: fails validation
-    roots, warnings = offload.default_read_roots(home=str(home))
-    assert roots == [] and len(warnings) == 1 and ".rustup" in warnings[0]
-    assert offload.default_read_roots(home=str(tmp_path / "empty")) == ([], [])  # absent roots are silent
-
-
-def test_default_read_roots_both_present(tmp_path):
-    (tmp_path / ".rustup").mkdir()
-    (tmp_path / ".cargo" / "registry").mkdir(parents=True)
-    (tmp_path / ".cargo" / "git").mkdir()
-    roots, warnings = offload.default_read_roots(home=str(tmp_path))
-    assert roots == [os.path.realpath(tmp_path / ".rustup")]
-    assert warnings == []  # ~/.cargo/registry and ~/.cargo/git are opt-in, never defaults
-
-
-def test_prepare_run_adds_defaults_and_keeps_warnings(tmp_path, repo, monkeypatch):
-    extra = os.path.realpath(tmp_path / "d")
-    os.mkdir(extra)
-    monkeypatch.setattr(offload, "default_read_roots", lambda home=None, repo_root=None: ([extra], ["w1"]))
-    _, ctx = prepare(tmp_path, repo)
-    assert extra in ctx["allow_read"] and ctx["warnings"] == ["w1"]
-    assert ctx["record"]["warnings"] == ["w1"] and extra in ctx["record"]["allow_read"]
-    assert f'(subpath "{extra}")' in Path(ctx["profile"]).read_text()
-
-
-# ------------------------------------------------------------------ worker-local git, commit_work
-
-def test_init_worker_git_and_commit_work_removes_it_first(tmp_path, repo, monkeypatch):
-    _, ctx = prepare(tmp_path, repo)
-    src = Path(ctx["src"])
-    offload.init_worker_git(ctx)
-    assert (src / ".git").is_dir()
-    assert git(src, "log", "--format=%s").strip() == "base"
-    assert git(src, "status", "--porcelain").strip() == ""
-    assert git(src, "config", "user.name").strip() == "offload"
-    (src / "new.txt").write_text("n\n")
-    seen = []
-    real = offload.safe_git
-
-    def spy(args, home, *a, **k):
-        if "add" in args:
-            seen.append((src / ".git").exists() or (src / ".git").is_symlink())
-        return real(args, home, *a, **k)
-    monkeypatch.setattr(offload, "safe_git", spy)
-    offload.commit_work(ctx)
-    assert seen == [False]  # src/.git was gone before `add -A`
-    assert not (src / ".git").exists()
-    assert "new.txt" in git(ctx["git_dir"], "show", "--stat", "--format=", "work")
-
-
-def test_commit_work_removes_symlink_or_file_dot_git(tmp_path, repo):
-    _, ctx = prepare(tmp_path, repo)
-    src = Path(ctx["src"])
-    (src / ".git").symlink_to(tmp_path)
-    offload.commit_work(ctx)
-    assert not os.path.lexists(src / ".git")
-
-
-# ------------------------------------------------------------------ sensitive paths
-
-def test_sensitive_paths_v03_additions():
-    names = ["requirements.txt", "Cargo.toml", "go.mod", "pom.xml", "build.gradle", "build.gradle.kts",
-             "settings.gradle", "settings.gradle.kts", ".pypirc", "sub/requirements-dev.txt"]
-    assert offload.sensitive_paths(names + ["plain.py", "README.md"]) == names
-
-
-# ------------------------------------------------------------------ registry proxy
-
-class FakeRegistry:
-    """A local plain-HTTP upstream. `pages` maps a path to (status, headers, body)."""
-
-    def __init__(self, delay=0.0):
-        self.seen = []
-        self.pages = {}
-        self.active = self.peak = 0
-        self.delay = delay
-        self._lock = threading.Lock()
-        reg = self
-
-        class H(http.server.BaseHTTPRequestHandler):
-            protocol_version = "HTTP/1.1"
-
-            def log_message(self, *a):
-                pass
-
-            def _any(self):
-                with reg._lock:
-                    reg.active += 1
-                    reg.peak = max(reg.peak, reg.active)
-                    reg.seen.append((self.command, self.path, dict(self.headers)))
-                try:
-                    time.sleep(reg.delay)
-                    status, hdrs, body = reg.pages.get(self.path.split("?")[0], (404, {}, b"nope"))
-                    self.send_response(status)
-                    for k, v in hdrs.items():
-                        self.send_header(k, v)
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    if self.command != "HEAD":
-                        self.wfile.write(body)
-                finally:
-                    with reg._lock:
-                        reg.active -= 1
-
-            do_GET = do_HEAD = _any
-
-        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
-        self.port = self.httpd.server_address[1]
-        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
-
-    def close(self):
-        self.httpd.shutdown()
-        self.httpd.server_close()
-
-
-def fake_connector(reg):
-    return lambda host, port, scheme: http.client.HTTPConnection("127.0.0.1", reg.port, timeout=10)
-
-
-def test_routes_in_design_table():
-    assert offload.REGISTRY_ROUTES == {
-        "/r/pypi/": "https://pypi.org/", "/r/pyfiles/": "https://files.pythonhosted.org/",
-        "/r/npm/": "https://registry.npmjs.org/", "/r/crates-index/": "https://index.crates.io/",
-        "/r/crates-static/": "https://static.crates.io/", "/r/maven/": "https://repo.maven.apache.org/maven2/"}
-    assert (offload.PROXY_MAX_CONNS, offload.PROXY_MAX_UPSTREAM) == (32, 8)
-    assert (offload.PROXY_CLIENT_TIMEOUT, offload.PROXY_HEADER_DEADLINE) == (30, 60)
-    assert offload.PROXY_RUN_BUDGET == 4 * 1024 ** 3 and offload.PROXY_REWRITE_CAP == 64 * 1024 * 1024
-
-
-@pytest.fixture
-def reg_proxy(tmp_path):
-    reg = FakeRegistry()
-    made = []
-
-    def make(**kw):
-        routes = kw.pop("routes", None) or {
-            "/r/pypi/": f"http://127.0.0.1:{reg.port}/", "/r/pyfiles/": f"http://localhost:{reg.port}/",
-            "/r/npm/": f"http://127.0.0.1:{reg.port}/npm/", "/r/crates-index/": f"http://127.0.0.1:{reg.port}/idx/",
-            "/r/crates-static/": f"http://localhost:{reg.port}/static/"}
-        px = offload.EgressProxy("http://127.0.0.1:9", str(tmp_path / "rej.log"), routes=routes,
-                                 connector=kw.pop("connector", fake_connector(reg)), **kw)
-        made.append(px)
-        return px, px.start()
-    yield reg, make, tmp_path / "rej.log"
-    for px in made:
-        px.stop()
-    reg.close()
-
-
-def wait_logged(px, n):
-    """The handler logs after the response is sent, so the client can be ahead of the log."""
-    for _ in range(200):
-        if px.registry_summary()["count"] >= n:
-            return
-        time.sleep(0.01)
-
-
-def get(port, path, method="GET", headers=None, body=None):
-    c, r = http_req(port, method, path, body, headers)
-    data = r.read()
-    c.close()
-    return r, data
-
-
-def test_registry_get_rebuilds_headers_and_rewrites_pypi(reg_proxy):
-    reg, make, log = reg_proxy
-    px, port = make()
-    reg.pages["/simple/pip/"] = (200, {"Content-Type": "text/html"},
-                                 b'<a href="https://files.pythonhosted.org/packages/ab/pip-1.whl">x</a>')
-    r, data = get(port, "/r/pypi/simple/pip/?x=1", headers={
-        "Authorization": "Bearer s", "Cookie": "c=1", "X-Evil": "1", "Accept": "text/html",
-        "Accept-Encoding": "gzip", "If-None-Match": '"e"', "If-Modified-Since": "Mon, 01 Jan 2024 00:00:00 GMT"})
-    assert r.status == 200 and r.getheader("Content-Length") == str(len(data))
-    assert data == f'<a href="http://127.0.0.1:{port}/r/pyfiles/packages/ab/pip-1.whl">x</a>'.encode()
-    method, path, hdrs = reg.seen[0]
-    assert (method, path) == ("GET", "/simple/pip/?x=1")
-    low = {k.lower(): v for k, v in hdrs.items()}
-    assert set(low) == {"host", "user-agent", "accept", "accept-encoding", "if-none-match", "if-modified-since",
-                        "connection"}
-    assert low["user-agent"] == "offload" and low["accept-encoding"] == "identity" and low["accept"] == "text/html"
-    assert not log.exists()
-
-
-def test_registry_rewrites_npm_crates_and_streams_binaries(reg_proxy):
-    reg, make, _ = reg_proxy
-    px, port = make()
-    reg.pages["/npm/left-pad"] = (200, {"Content-Type": "application/vnd.npm.install-v1+json"},
-                                  b'{"tarball":"https://registry.npmjs.org/left-pad/-/left-pad-1.tgz"}')
-    r, data = get(port, "/r/npm/left-pad")
-    assert data == f'{{"tarball":"http://127.0.0.1:{port}/r/npm/left-pad/-/left-pad-1.tgz"}}'.encode()
-    reg.pages["/idx/config.json"] = (200, {"Content-Type": "application/json"},
-                                     b'{"dl":"https://static.crates.io/crates","api":"https://crates.io"}')
-    r, data = get(port, "/r/crates-index/config.json")
-    assert json.loads(data) == {"dl": f"http://127.0.0.1:{port}/r/crates-static/crates", "api": None}
-    blob = b"https://registry.npmjs.org/ stays\x00"
-    reg.pages["/npm/left-pad/-/left-pad-1.tgz"] = (200, {"Content-Type": "application/octet-stream"}, blob)
-    r, data = get(port, "/r/npm/left-pad/-/left-pad-1.tgz")
-    assert data == blob  # not rewritten
-    r, data = get(port, "/r/npm/left-pad/-/left-pad-1.tgz", method="HEAD")
-    assert r.status == 200 and data == b"" and r.getheader("Content-Length") == str(len(blob))
-
-
-@pytest.mark.parametrize("method", ["PUT", "POST", "DELETE", "PATCH", "CONNECT", "OPTIONS", "FOO"])
-def test_registry_other_methods_403(reg_proxy, method):
-    reg, make, log = reg_proxy
-    px, port = make()
-    c, r = http_req(port, method, "/r/npm/x", b"{}" if method in ("PUT", "POST", "PATCH") else None)
-    assert r.status == 403
-    c.close()
-    assert reg.seen == [] and method in log.read_text()
-
-
-def test_registry_connect_authority_form_403(reg_proxy):
-    reg, make, log = reg_proxy
-    px, port = make()
-    c, r = http_req(port, "CONNECT", "pypi.org:443")
-    assert r.status == 403
-    c.close()
-    assert reg.seen == []
-
-
-def test_registry_get_with_body_refused(reg_proxy):
-    reg, make, _ = reg_proxy
-    px, port = make()
-    r, _ = get(port, "/r/pypi/simple/pip/", body=b"data", headers={"Content-Length": "4"})
-    assert r.status == 403
-    r, _ = get(port, "/r/pypi/simple/pip/", headers={"Transfer-Encoding": "chunked"})
-    assert r.status == 403
-    assert reg.seen == []
-
-
-@pytest.mark.parametrize("target", [
-    "http://pypi.org/simple/pip/", "http://example.com/", "https://evil.example/r/pypi/simple/",
-    "/r/pypi/../../x", "/r/pypi/a/../b", "/r/pypi/a//b", "/r/pypi/a%2e%2e/b", "/r/pypi/%2e%2e%2fx",
-    "/r/pypi/a%5cb", "/r/pypi/a\\b", "/r/pypi/%2Fblob", "/r/pypi/a%00b", "/r/pypi/a%0ab", "/r/pypi/%ff", "/r/nope/", "/r/pypi",
-    "/r/", "/r", "/R/pypi/simple/", "/v1/messages", "/r/pypi/x?a=\\b", "/r/pypi/x?a=\x01"])
-def test_registry_path_and_target_rules_403(reg_proxy, target):
-    reg, make, log = reg_proxy
-    px, port = make()
-    s = socket.create_connection(("127.0.0.1", port), timeout=5)
-    s.sendall(f"GET {target} HTTP/1.1\r\nHost: x\r\n\r\n".encode("latin-1"))
-    status = s.recv(100).split(b"\r\n")[0]
-    s.close()
-    assert b" 403 " in status, status
-    assert reg.seen == []
-
-
-def test_registry_upstream_url_is_constant_base_plus_requoted_rest(reg_proxy):
-    reg, make, _ = reg_proxy
-    px, port = make()
-    reg.pages["/simple/a%20b/@evil.com/"] = (200, {"Content-Type": "text/plain"}, b"ok")
-    r, data = get(port, "/r/pypi/simple/a%20b/@evil.com/")
-    assert r.status == 200 and data == b"ok"
-    assert reg.seen[0][1] == "/simple/a%20b/@evil.com/"
-    assert reg.seen[0][2]["Host"] == f"127.0.0.1:{reg.port}"  # the table's host, never the worker's
-    r, _ = get(port, "/r/pypi/simple/x/", headers={"Host": "evil.example"})
-    assert reg.seen[-1][2]["Host"] == f"127.0.0.1:{reg.port}"
-
-
-def test_registry_redirects_rewritten_or_502(reg_proxy):
-    reg, make, _ = reg_proxy
-    px, port = make()
-    reg.pages["/to-files"] = (302, {"Location": f"http://localhost:{reg.port}/packages/p.whl"}, b"")
-    reg.pages["/to-evil"] = (302, {"Location": "https://evil.example/x"}, b"")
-    reg.pages["/relative"] = (301, {"Location": "/simple/pip/"}, b"")
-    r, _ = get(port, "/r/pypi/to-files")
-    assert r.status == 302 and r.getheader("Location") == f"http://127.0.0.1:{port}/r/pyfiles/packages/p.whl"
-    r, _ = get(port, "/r/pypi/to-evil")
-    assert r.status == 502 and r.getheader("Location") is None
-    r, _ = get(port, "/r/pypi/relative")
-    assert r.status == 301 and r.getheader("Location") == f"http://127.0.0.1:{port}/r/pypi/simple/pip/"
-    assert len(reg.seen) == 3  # nothing followed
-
-
-def test_registry_non_global_address_is_502():
-    def fake(addr):
-        return lambda host, port, **kw: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (addr, port))]
-    for bad in ("10.0.0.5", "127.0.0.1", "169.254.169.254", "192.168.1.1", "100.64.0.1"):
-        with pytest.raises(offload.UpstreamBlocked):
-            offload.connect_registry("pypi.org", resolver=fake(bad))
-    mixed = lambda host, port, **kw: [(2, 1, 6, "", ("8.8.8.8", port)), (2, 1, 6, "", ("10.0.0.5", port))]
-    with pytest.raises(offload.UpstreamBlocked):
-        offload.connect_registry("pypi.org", resolver=mixed)
-    v6 = lambda host, port, **kw: [(socket.AF_INET6, 1, 6, "", ("::1", port, 0, 0))]
-    with pytest.raises(offload.UpstreamBlocked):
-        offload.connect_registry("pypi.org", resolver=v6)
-    conn = offload.connect_registry("pypi.org", resolver=fake("151.101.0.223"))
-    assert conn.host == "pypi.org" and conn.port == 443  # not connected yet; SNI/verification name is the host
-
-
-def test_registry_proxy_returns_502_for_blocked_address(reg_proxy):
-    reg, make, _ = reg_proxy
-    private = lambda host, port, **kw: [(2, 1, 6, "", ("10.0.0.5", port))]
-    px, port = make(connector=lambda h, p, s: offload.connect_registry(h, p, resolver=private))
-    r, _ = get(port, "/r/pypi/simple/pip/")
-    assert r.status == 502 and reg.seen == []
-
-
-def test_registry_rewrite_cap_and_other_responses_stream(reg_proxy):
-    reg, make, _ = reg_proxy
-    px, port = make(rewrite_cap=50)
-    reg.pages["/simple/big/"] = (200, {"Content-Type": "text/html"}, b"x" * 51)
-    reg.pages["/simple/ok/"] = (200, {"Content-Type": "text/html"}, b"x" * 50)
-    reg.pages["/blob"] = (200, {"Content-Type": "application/octet-stream"}, b"y" * 500)
-    assert get(port, "/r/pypi/simple/big/")[0].status == 502
-    assert get(port, "/r/pypi/simple/ok/")[0].status == 200
-    r, data = get(port, "/r/pypi/blob")
-    assert r.status == 200 and data == b"y" * 500
-
-
-def test_registry_run_download_budget(reg_proxy):
-    reg, make, log = reg_proxy
-    px, port = make(run_budget=100)
-    reg.pages["/blob"] = (200, {"Content-Type": "application/octet-stream"}, b"z" * 80)
-    assert get(port, "/r/pypi/blob")[0].status == 200
-    assert get(port, "/r/pypi/blob")[0].status == 200  # 80 < 100 when it started
-    r, _ = get(port, "/r/pypi/blob")
-    assert r.status == 403 and len(reg.seen) == 2 and "budget" in log.read_text()
-    assert get(port, "/v1/messages")[0].status == 403  # unrelated rules unchanged
-
-
-def test_proxy_connection_cap_closes_extras_and_logs(reg_proxy):
-    reg, make, log = reg_proxy
-    px, port = make(max_conns=4)
-    held = [socket.create_connection(("127.0.0.1", port), timeout=3) for _ in range(4)]
-    time.sleep(0.2)
-    extra = socket.create_connection(("127.0.0.1", port), timeout=3)
-    assert extra.recv(1) == b""  # accepted and closed at once
-    extra.close()
-    assert "connection limit" in log.read_text()
-    held.pop().close()
-    time.sleep(0.3)
-    reg.pages["/simple/pip/"] = (200, {"Content-Type": "text/plain"}, b"ok")
-    assert get(port, "/r/pypi/simple/pip/")[1] == b"ok"  # a freed slot works again
-    for c in held:
-        c.close()
-
-
-def test_registry_upstream_concurrency_cap():
-    reg = FakeRegistry(delay=0.3)
-    reg.pages["/blob"] = (200, {"Content-Type": "application/octet-stream"}, b"b")
-    tmp = Path(__import__("tempfile").mkdtemp())
-    px = offload.EgressProxy("http://127.0.0.1:9", str(tmp / "l"), routes={"/r/pypi/": f"http://127.0.0.1:{reg.port}/"},
-                             connector=fake_connector(reg), max_upstream=2)
-    port = px.start()
-    try:
-        results = []
-        ts = [threading.Thread(target=lambda: results.append(get(port, "/r/pypi/blob")[0].status)) for _ in range(6)]
-        [t.start() for t in ts]
-        [t.join(20) for t in ts]
-        assert results == [200] * 6 and reg.peak <= 2
-    finally:
-        px.stop()
-        reg.close()
-
-
-def test_proxy_header_deadline_closes_slow_client(reg_proxy):
-    reg, make, _ = reg_proxy
-    px, port = make(header_deadline=0.5)
-    s = socket.create_connection(("127.0.0.1", port), timeout=5)
-    s.sendall(b"GET /r/pypi/simple/pip/ HTTP/1.1\r\nHost: x\r\n")  # headers never finish
-    t0 = time.monotonic()
-    assert s.recv(10) == b""
-    assert time.monotonic() - t0 < 4
-    s.close()
-    assert reg.seen == []
-
-
-def test_proxy_client_socket_timeout_is_30s():
-    px = offload.EgressProxy("http://127.0.0.1:9", os.devnull)
-    try:
-        assert px.httpd.RequestHandlerClass.timeout == 30
-    finally:
-        px.httpd.server_close()
-
-
-@needs_sandbox
-def test_integration_cmd_run_inits_worker_git_writes_configs_and_reports_warnings(tmp_path, repo, monkeypatch, capsys):
-    ohome = os.path.realpath(tmp_path / "ohome")
-    brief = tmp_path / "brief.md"
-    brief.write_text("do it\n")
-    seen = {}
-    monkeypatch.setattr(offload, "resolve_claude", lambda allow=False: fake_claude())
-    monkeypatch.setattr(offload, "default_read_roots", lambda home=None, repo_root=None: ([], ["default root skipped"]))
-    monkeypatch.setattr(offload, "run_selftest", lambda c: (True, []))
-
-    def fake_launch(ctx, brief_text, timeout_s):
-        src, home = Path(ctx["src"]), Path(ctx["run_dir"]) / "home"
-        seen["log"] = git(src, "log", "--format=%s").strip()
-        seen["cargo"] = (home / ".cargo" / "config.toml").read_text()
-        seen["mvn"] = (home / ".m2" / "settings.xml").read_text()
-        seen["port"] = ctx["proxy_port"]
-        return {"init_problems": [], "saw_init": True, "timed_out": False, "result": {"is_error": False}, "usage": {},
-                "text": "", "returncode": 0, "turns": 1, "survivors_killed": []}
-    monkeypatch.setattr(offload, "launch_worker", fake_launch)
-    assert offload.main(["--home", ohome, "run", "--repo", str(repo), "--brief", str(brief), "--slug", "job",
-                         "--registries", "maven,crates"]) == 0
-    out = json.loads(capsys.readouterr().out)
-    assert out["registries"] == ["crates", "maven"]
-    assert out["warnings"] == ["default root skipped"] and out["status"] == "ok"
-    assert seen["log"] == "base"
-    assert f"sparse+http://127.0.0.1:{seen['port']}/r/crates-index/" in seen["cargo"]
-    assert f"http://127.0.0.1:{seen['port']}/r/maven/" in seen["mvn"]
-
-
-# ------------------------------------------------------------------ fix pass (Opus review of 7f02271)
-
-def test_registry_304_passes_through(reg_proxy):
-    reg, make, _ = reg_proxy
-    px, port = make()
-    reg.pages["/blob"] = (304, {"ETag": '"e1"', "Last-Modified": "Mon, 01 Jan 2024 00:00:00 GMT"}, b"")
-    r, data = get(port, "/r/pypi/blob", headers={"If-None-Match": '"e1"'})
-    assert r.status == 304 and data == b"" and r.getheader("ETag") == '"e1"'
-    assert r.getheader("Last-Modified")
-
-
-def test_registry_relative_location_does_not_double_base_path(reg_proxy):
-    reg, make, _ = reg_proxy
-    px, port = make(routes={"/r/maven/": f"http://127.0.0.1:{reg.port}/maven2/"})
-    reg.pages["/maven2/a/b"] = (302, {"Location": "c"}, b"")
-    r, _ = get(port, "/r/maven/a/b")
-    assert r.status == 302 and r.getheader("Location") == f"http://127.0.0.1:{port}/r/maven/a/c"
-
-
-def test_registry_budget_counts_rewrite_bytes_including_oversize(reg_proxy):
-    reg, make, _ = reg_proxy
-    px, port = make(rewrite_cap=50)
-    reg.pages["/simple/big/"] = (200, {"Content-Type": "text/html"}, b"x" * 60)
-    reg.pages["/simple/ok/"] = (200, {"Content-Type": "text/html"}, b"y" * 40)
-    assert get(port, "/r/pypi/simple/big/")[0].status == 502
-    assert px.downloaded == 51  # cap + 1 bytes were read before the cap check
-    assert get(port, "/r/pypi/simple/ok/")[0].status == 200
-    assert px.downloaded == 91  # counted once, not again when sent
-
-
-@pytest.mark.parametrize("addr", ["::127.0.0.1", "64:ff9b::7f00:1", "::ffff:127.0.0.1", "::ffff:10.0.0.1", "::10.0.0.1"])
-def test_embedded_ipv4_in_ipv6_is_blocked(addr):
-    res = lambda host, port, **kw: [(socket.AF_INET6, 1, 6, "", (addr, port, 0, 0))]
-    with pytest.raises(offload.UpstreamBlocked):
-        offload.connect_registry("pypi.org", resolver=res)
-
-
-def test_connect_tries_each_vetted_address(monkeypatch):
-    tried = []
-
-    def fake_cc(addr, timeout=None):
-        tried.append(addr)
-        if addr[0] == "151.101.0.1":
-            raise ConnectionRefusedError()
-        raise ssl.SSLError("stop here")  # past the connect loop; enough to prove the second address was used
-    import ssl as _ssl
-    globals()["ssl"] = _ssl
-    res = lambda host, port, **kw: [(2, 1, 6, "", ("151.101.0.1", port)), (2, 1, 6, "", ("151.101.0.2", port))]
-    monkeypatch.setattr(offload.socket, "create_connection", fake_cc)
-    conn = offload.connect_registry("pypi.org", resolver=res)
-    with pytest.raises(OSError):
-        conn.connect()
-    assert tried == [("151.101.0.1", 443), ("151.101.0.2", 443)]
-
-
-import ssl  # noqa: E402
-
-
-def test_pinned_connect_verifies_certificate_and_uses_vetted_ip(monkeypatch, tmp_path):
-    key, crt = tmp_path / "k.pem", tmp_path / "c.pem"
-    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key), "-out", str(crt),
-                    "-subj", "/CN=pypi.org", "-days", "1"], check=True, capture_output=True)
-    sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    sctx.load_cert_chain(str(crt), str(key))
-    srv = socket.socket()
-    srv.bind(("127.0.0.1", 0))
-    srv.listen(5)
-
-    def serve():
-        try:
-            c, _ = srv.accept()
-            try:
-                sctx.wrap_socket(c, server_side=True)
-            except OSError:
-                pass
-        except OSError:
-            pass
-    threading.Thread(target=serve, daemon=True).start()
-    real_cc, seen = socket.create_connection, []
-
-    def fake_cc(addr, timeout=None):
-        seen.append(addr)
-        return real_cc(("127.0.0.1", srv.getsockname()[1]), timeout)
-    monkeypatch.setattr(offload.socket, "create_connection", fake_cc)
-    cctx = ssl.create_default_context()  # default verification: the self-signed cert is not trusted
-    names, orig = [], cctx.wrap_socket
-    cctx.wrap_socket = lambda sock, **kw: (names.append(kw.get("server_hostname")), orig(sock, **kw))[1]
-    res = lambda host, port, **kw: [(2, 1, 6, "", ("151.101.0.223", port))]
-    conn = offload.connect_registry("pypi.org", resolver=res, ssl_context=cctx, timeout=5)
-    try:
-        with pytest.raises(ssl.SSLCertVerificationError):
-            conn.connect()
-    finally:
-        srv.close()
-    assert seen == [("151.101.0.223", 443)] and names == ["pypi.org"]
-
-
-def test_registry_pipelined_second_request_is_not_served(reg_proxy):
-    reg, make, _ = reg_proxy
-    px, port = make()
-    reg.pages["/simple/pip/"] = (200, {"Content-Type": "text/plain"}, b"ok")
-    s = socket.create_connection(("127.0.0.1", port), timeout=5)
-    one = b"GET /r/pypi/simple/pip/ HTTP/1.1\r\nHost: x\r\n\r\n"
-    s.sendall(one + one)
-    buf = b""
-    while True:
-        chunk = s.recv(4096)
-        if not chunk:
-            break
-        buf += chunk
-    s.close()
-    assert buf.count(b"HTTP/1.1 ") == 1 and len(reg.seen) == 1
-
-
-def test_sensitive_lists_fix_pass():
-    names = ["package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "Cargo.lock", "go.sum",
-             "poetry.lock", "uv.lock", "Pipfile", "Pipfile.lock", ".pnpmfile.cjs", "gradle-wrapper.properties",
-             ".cargo/config.toml", "a/.mvn/maven.config", ".mvn/jvm.config"]
-    assert offload.sensitive_paths(names) == names
-    assert {".cargo", ".mvn"} <= offload.SENSITIVE_DIRS
-
-
-def test_registry_request_log_and_summary(reg_proxy):
-    reg, make, log = reg_proxy
-    px, port = make()
-    reg.pages["/npm/left-pad"] = (200, {"Content-Type": "application/json"}, b"{}")
-    get(port, "/r/npm/left-pad")
-    get(port, "/r/npm/left-pad/-/left-pad-1.tgz")
-    get(port, "/r/npm/other")
-    get(port, "/r/pypi/simple/pip/")
-    wait_logged(px, 4)
-    assert px.request_log == str(log.parent / "registry_requests.log")
-    lines = Path(px.request_log).read_text().splitlines()
-    assert len(lines) == 4
-    assert "GET /r/npm/left-pad 200 2" in lines[0] and " 404 " in lines[1]
-    assert px.registry_summary() == {"count": 4, "packages": ["left-pad", "other", "pip"]}
-    for i in range(60):
-        px.log_request("GET", f"/r/npm/p{i}", 200, 0, "/r/npm/", f"p{i}")
-    assert len(px.registry_summary()["packages"]) == 50 and px.registry_summary()["count"] == 64
-    px.log_request("GET", "/r/npm/a\x1b[31mb", 200, 0, "/r/npm/", "a\x1b[31mb")
-    assert "\x1b" not in Path(px.request_log).read_text()
-
-
-@needs_sandbox
-def test_cmd_run_reports_registry_requests(tmp_path, repo, monkeypatch, capsys):
-    ohome = os.path.realpath(tmp_path / "ohome")
-    brief = tmp_path / "brief.md"
-    brief.write_text("do it\n")
-    monkeypatch.setattr(offload, "resolve_claude", lambda allow=False: fake_claude())
-    monkeypatch.setattr(offload, "run_selftest", lambda c: (True, []))
-    monkeypatch.setattr(offload, "launch_worker", lambda *a, **k: {
-        "init_problems": [], "saw_init": True, "timed_out": False, "result": {"is_error": False}, "usage": {},
-        "text": "", "returncode": 0, "turns": 1, "survivors_killed": []})
-    assert offload.main(["--home", ohome, "run", "--repo", str(repo), "--brief", str(brief), "--slug", "job"]) == 0
-    out = json.loads(capsys.readouterr().out)
-    assert out["registry_requests"] == {"count": 0, "packages": []}
-    rec = json.loads((Path(ohome) / "runs" / out["run_id"] / "run.json").read_text())
-    assert rec["registry_requests"] == {"count": 0, "packages": []}
-
-
-@needs_sandbox
-def test_cmd_run_records_session_id(tmp_path, repo, monkeypatch, capsys):
-    ohome = os.path.realpath(tmp_path / "ohome")
-    brief = tmp_path / "brief.md"
-    brief.write_text("do it\n")
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "sess-123")
-    monkeypatch.setattr(offload, "resolve_claude", lambda allow=False: fake_claude())
-    monkeypatch.setattr(offload, "run_selftest", lambda c: (True, []))
-    monkeypatch.setattr(offload, "launch_worker", lambda *a, **k: {
-        "init_problems": [], "saw_init": True, "timed_out": False, "result": {"is_error": False}, "usage": {},
-        "text": "", "returncode": 0, "turns": 1, "survivors_killed": []})
-    assert offload.main(["--home", ohome, "run", "--repo", str(repo), "--brief", str(brief), "--slug", "job"]) == 0
-    out = json.loads(capsys.readouterr().out)
-    rec = json.loads((Path(ohome) / "runs" / out["run_id"] / "run.json").read_text())
-    assert rec["session_id"] == "sess-123"
-
-
-# ------------------------------------------------------------------ registries are on by default (user decision 2026-10-29)
-
-def test_parse_registries():
-    assert offload.parse_registries("") == [] and offload.parse_registries(None) == []
-    assert offload.parse_registries("none") == [] and offload.parse_registries(" none ") == []
-    assert offload.parse_registries("maven, pypi,pypi") == ["pypi", "maven"]
-    for bad in ("pip", "pypi,go", ","):
-        with pytest.raises(offload.OffloadError):
-            offload.parse_registries(bad)
-
-
-def test_registry_groups_map_to_routes():
-    assert offload.REGISTRY_GROUPS["pypi"] == ("/r/pypi/", "/r/pyfiles/")
-    assert offload.REGISTRY_GROUPS["crates"] == ("/r/crates-index/", "/r/crates-static/")
-    assert {p for g in offload.REGISTRY_GROUPS.values() for p in g} == set(offload.REGISTRY_ROUTES)
-
-
-def test_proxy_serves_no_registry_route_by_default(tmp_path):
-    px = offload.EgressProxy("http://127.0.0.1:9", str(tmp_path / "rej.log"))
-    try:
-        port = px.start()
-        assert get(port, "/r/pypi/simple/pip/")[0].status == 403
-        assert get(port, "/r/maven/a/b")[0].status == 403
-        assert "/r/pypi/simple/pip/" in (tmp_path / "rej.log").read_text()
-        assert px.routes == {}
-    finally:
-        px.stop()
-
-
-def test_proxy_enables_only_named_registry_groups(tmp_path):
-    px = offload.EgressProxy("http://127.0.0.1:9", str(tmp_path / "rej.log"), registries=["pypi", "crates"])
-    try:
-        assert set(px.routes) == {"/r/pypi/", "/r/pyfiles/", "/r/crates-index/", "/r/crates-static/"}
-        port = px.start()
-        assert get(port, "/r/npm/left-pad")[0].status == 403
-    finally:
-        px.stop()
-
-
-def test_worker_env_and_configs_only_for_enabled_registries(tmp_path):
-    none = offload.build_worker_env("/r", "m", "http://127.0.0.1:5")
-    assert not {"PIP_INDEX_URL", "PIP_TRUSTED_HOST", "UV_DEFAULT_INDEX", "UV_INSECURE_HOST", "NPM_CONFIG_REGISTRY"} & set(none)
-    pip = offload.build_worker_env("/r", "m", "http://127.0.0.1:5", registries=["pypi"])
-    assert "PIP_INDEX_URL" in pip and "NPM_CONFIG_REGISTRY" not in pip
-    npm = offload.build_worker_env("/r", "m", "http://127.0.0.1:5", registries=["npm"])
-    assert "NPM_CONFIG_REGISTRY" in npm and "PIP_INDEX_URL" not in npm
-    assert set(none) | {"PIP_INDEX_URL", "PIP_TRUSTED_HOST", "UV_DEFAULT_INDEX", "UV_INSECURE_HOST", "NPM_CONFIG_REGISTRY"} == offload.WORKER_ENV_KEYS
-    offload.write_registry_configs(str(tmp_path), "http://127.0.0.1:5")
-    assert not (tmp_path / "home" / ".cargo" / "config.toml").exists()
-    assert not (tmp_path / "home" / ".m2" / "settings.xml").exists()
-    offload.write_registry_configs(str(tmp_path), "http://127.0.0.1:5", ["maven"])
-    assert (tmp_path / "home" / ".m2" / "settings.xml").exists()
-    assert not (tmp_path / "home" / ".cargo" / "config.toml").exists()
-
-
-@needs_sandbox
-def test_cmd_run_registries_flag_recorded_and_unknown_rejected(tmp_path, repo, monkeypatch, capsys):
-    ohome = os.path.realpath(tmp_path / "ohome")
-    brief = tmp_path / "brief.md"
-    brief.write_text("do it\n")
-    monkeypatch.setattr(offload, "resolve_claude", lambda allow=False: fake_claude())
-    monkeypatch.setattr(offload, "run_selftest", lambda c: (True, []))
-    seen = {}
-
-    def fake_launch(ctx, *a, **k):
-        seen["routes"] = sorted(os.listdir(Path(ctx["run_dir"]) / "home"))
-        seen["m2"] = (Path(ctx["run_dir"]) / "home" / ".m2" / "settings.xml").exists()
-        seen["cargo"] = (Path(ctx["run_dir"]) / "home" / ".cargo" / "config.toml").exists()
-        return {"init_problems": [], "saw_init": True, "timed_out": False, "result": {"is_error": False}, "usage": {},
-                "text": "", "returncode": 0, "turns": 1, "survivors_killed": []}
-    monkeypatch.setattr(offload, "launch_worker", fake_launch)
-    base = ["--home", ohome, "run", "--repo", str(repo), "--brief", str(brief)]
-    assert offload.main(base + ["--slug", "default"]) == 0
-    out = json.loads(capsys.readouterr().out)
-    assert out["registries"] == ["pypi", "npm", "crates", "maven"] and seen["m2"] is True and seen["cargo"] is True
-    assert offload.main(base + ["--slug", "off", "--registries", "none"]) == 0
-    out = json.loads(capsys.readouterr().out)
-    assert out["registries"] == [] and seen["m2"] is False and seen["cargo"] is False
-    rec = json.loads((Path(ohome) / "runs" / out["run_id"] / "run.json").read_text())
-    assert rec["registries"] == []
-    assert offload.main(base + ["--slug", "on", "--registries", "maven"]) == 0
-    out = json.loads(capsys.readouterr().out)
-    assert out["registries"] == ["maven"] and seen["m2"] is True and seen["cargo"] is False
-    rec = json.loads((Path(ohome) / "runs" / out["run_id"] / "run.json").read_text())
-    assert rec["registries"] == ["maven"]
-    assert rec["host_listeners"] == [22, 11434, 18080]  # the faked snapshot
-    assert "blocked_ports" not in rec
-
-    def no_netstat():
-        raise offload.OffloadError("cannot snapshot host listeners (netstat failed)")
-    monkeypatch.setattr(offload, "snapshot_listen_ports", no_netstat)
-    seen.clear()
-    assert offload.main(base + ["--slug", "nonet"]) != 0  # fail closed: no snapshot, no run
-    cap = capsys.readouterr()
-    assert "snapshot host listeners" in cap.out + cap.err and "routes" not in seen  # the worker never launched
-    runs_before = sorted(os.listdir(Path(ohome) / "runs"))
-    assert offload.main(base + ["--slug", "bad", "--registries", "pypi,nope"]) != 0
-    assert sorted(os.listdir(Path(ohome) / "runs")) == runs_before  # nothing prepared, nothing spent
-
-
-@pytest.mark.parametrize("prefix,rest,name", [
-    ("/r/pypi/", "simple/requests/", "requests"),
-    ("/r/pypi/", "simple/requests", "requests"),
-    ("/r/pypi/", "requests/json", "requests"),
-    ("/r/pypi/", "simple/", ""),
-    ("/r/pyfiles/", "packages/ab/cd/ef0123/requests-2.31.0.tar.gz", "requests"),
-    ("/r/pyfiles/", "packages/ab/cd/ef0123/my_pkg-1.0-py3-none-any.whl", "my_pkg"),
-    ("/r/pyfiles/", "packages/ab/cd/ef/weird.whl", "weird.whl"),
-    ("/r/npm/", "left-pad", "left-pad"),
-    ("/r/npm/", "left-pad/-/left-pad-1.0.0.tgz", "left-pad"),
-    ("/r/npm/", "@types/node", "@types/node"),
-    ("/r/npm/", "@types/node/-/node-1.tgz", "@types/node"),
-    ("/r/crates-static/", "crates/serde/serde-1.0.0.crate", "serde"),
-    ("/r/crates-index/", "se/rd/serde", "serde"),
-    ("/r/crates-index/", "config.json", ""),
-    ("/r/maven/", "org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.jar", "org/apache/commons/commons-lang3"),
-    ("/r/maven/", "org/apache/commons/commons-lang3/maven-metadata.xml", "org/apache/commons/commons-lang3"),
-    ("/r/maven/", "org/apache/commons/commons-lang3/3.12.0/", "org/apache/commons/commons-lang3"),
-])
-def test_registry_package_names_per_route(prefix, rest, name):
-    assert offload.registry_package(prefix, rest) == name
-
-
-def test_registry_summary_holds_real_package_names(reg_proxy):
-    reg, make, _ = reg_proxy
-    px, port = make()
-    for path in ("/r/pypi/simple/requests/", "/r/npm/@types/node", "/r/crates-static/crates/serde/serde-1.0.crate"):
-        get(port, path)
-    wait_logged(px, 3)
-    assert px.registry_summary()["packages"] == ["requests", "@types/node", "serde"]
+    assert not offload.ref_exists(str(repo), "refs/heads/offload/feat", "/var/empty")
