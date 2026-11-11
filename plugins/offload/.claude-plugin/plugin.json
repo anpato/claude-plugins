@@ -1,7 +1,7 @@
 {
   "name": "offload",
-  "description": "Delegate a well-specified build task to a cheaper model (Kimi on Ollama Cloud) running in a macOS sandbox, then review the result as an untrusted diff before merging.",
-  "version": "0.5.2",
+  "description": "Delegate a well-specified build task to another model (Kimi/Ollama or a local GPU worker via Claude Code, or OpenAI codex on your subscription) in an isolated git copy, then review the result as an untrusted diff before merging.",
+  "version": "0.6.0",
   "author": {
     "name": "apato"
   },
@@ -11,8 +11,7 @@
     "subagent",
     "ollama",
     "kimi",
-    "sandbox",
-    "cost",
-    "macos"
+    "codex",
+    "cost"
   ]
 }

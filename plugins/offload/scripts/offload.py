@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Delegate a build task to a sandboxed, cheaper model (Claude Code on Ollama Cloud).
+"""Delegate a build task to a worker agent CLI, in an isolated git copy, then review the result.
 
-macOS only (sandbox-exec). The worker model and everything it writes are untrusted.
-See ../DESIGN.md for the threat model and the run flow.
+The worker runs directly (no offload sandbox): a Claude Code worker pointed at a local/Ollama model,
+or `codex exec` on the user's subscription. The worker reaches the network and runs commands freely;
+the safety model is provider security + nothing-runs-until-you-merge + reviewing the diff. Everything
+the worker writes (code, tests, result text, commits) is untrusted and must be reviewed before merge.
+See ../DESIGN.md for the threat model and the run flow. macOS/Linux; no platform-specific jail.
 
-  offload.py [--home DIR] run --repo R --brief F [--slug S] [--model M] [--max-turns N]
-                              [--timeout-min T] [--max-thinking-tokens N] [--allow-read PATH]...
-                              [--base-url URL | --worker NAME]
+  offload.py [--home DIR] run --repo R --brief F [--slug S] [--kind claude|codex] [--model M]
+                              [--worker NAME] [--base-url URL] [--max-turns N] [--timeout-min T]
+                              [--max-thinking-tokens N]
   offload.py [--home DIR] test --run ID [--timeout-s N] -- CMD...
   offload.py [--home DIR] diff --run ID [-- PATH...]
   offload.py [--home DIR] list
@@ -21,8 +24,6 @@ Every subcommand prints JSON to stdout; `diff` prints the diff text and then a J
 import argparse
 import getpass
 import hashlib
-import http.client
-import ipaddress
 import json
 import os
 import pwd
@@ -31,17 +32,13 @@ import secrets
 import selectors
 import shutil
 import signal
-import socket
-import ssl
 import subprocess
 import sys
 import tarfile
 import threading
 import time
-import urllib.request
 import unicodedata
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import quote, unquote, urljoin, urlsplit
+from urllib.parse import urlsplit
 
 DEFAULT_MODEL = "kimi-k3:cloud"
 DEFAULT_BASE_URL = "http://localhost:11434"
@@ -52,89 +49,16 @@ UNTRUSTED_LIMIT = 4096
 SAFE_PATH = "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin"
 # First on the worker's PATH only (never the helper's): the real python3/git, not the xcrun shims.
 CLT_BIN = "/Library/Developer/CommandLineTools/usr/bin"
-SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$")
 RUN_ID_RE = re.compile(r"^[0-9a-f]{8}-[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$")
 MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}$")
+KINDS = ("claude", "codex")
 ALLOWED_TOOLS = ("Bash", "Read", "Edit", "Write", "Glob", "Grep")
 DENIED_TOOLS = ("WebFetch", "WebSearch", "Agent", "Skill")
-LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
-# Whether the worker may bind and listen on loopback. SBPL cannot tell a loopback listen from a wildcard one,
-# so a worker listener can be reachable from the LAN; run.json records `worker_listeners` either way.
-ALLOW_LISTEN = True
-# USD per 1M tokens: (input, cache read, output)
+# USD per 1M tokens: (input, cache read, output). codex runs on a flat subscription: no per-token estimate.
 PRICES = {"kimi-k3:cloud": (3.0, 0.30, 15.0)}
-# --allow-read is an allowlist: paths under these (relative to $HOME) or under these repo subdirs.
-ALLOW_READ_HOME = ("go/pkg/mod", ".cargo/registry", ".cargo/git", ".rustup", ".m2/repository",
-                   ".gradle/caches", ".npm/_cacache")
-ALLOW_READ_REPO = ("node_modules", "vendor", ".venv")
-# Readable on every run when present: toolchains only. ~/.cargo/registry can hold private registries.
-DEFAULT_READ_HOME = (".rustup",)
-PROXY_ALLOWED_PATHS = ("/v1/messages", "/v1/messages/count_tokens")
-PROXY_MAX_BODY = 32 * 1024 * 1024
-PROXY_UPSTREAM_TIMEOUT = 900
-# Registry routes of the egress proxy: GET/HEAD only, each prefix to one constant upstream.
-REGISTRY_ROUTES = {
-    "/r/pypi/": "https://pypi.org/",
-    "/r/pyfiles/": "https://files.pythonhosted.org/",
-    "/r/npm/": "https://registry.npmjs.org/",
-    "/r/crates-index/": "https://index.crates.io/",
-    "/r/crates-static/": "https://static.crates.io/",
-    "/r/maven/": "https://repo.maven.apache.org/maven2/",
-}
-# `run --registries` names -> routes served (user decision 2026-10-29: all on by default; `none` turns them off)
-REGISTRY_GROUPS = {
-    "pypi": ("/r/pypi/", "/r/pyfiles/"),
-    "npm": ("/r/npm/",),
-    "crates": ("/r/crates-index/", "/r/crates-static/"),
-    "maven": ("/r/maven/",),
-}
-
-
-def parse_registries(value):
-    """'pypi,npm' -> ['npm', 'pypi'] (canonical order), 'none' -> []; an unknown name is an error before any spend."""
-    if (value or "").strip() == "none":
-        return []
-    names = [n.strip() for n in (value or "").split(",") if n.strip()]
-    bad = [n for n in names if n not in REGISTRY_GROUPS]
-    if bad or (value and not names):
-        raise OffloadError(f"unknown registry {bad or value!r}; choose from {', '.join(REGISTRY_GROUPS)}")
-    return [n for n in REGISTRY_GROUPS if n in names]
-
-
-def registry_package(prefix, rest):
-    """The package a /r/ request is for, taken from the decoded path after the route prefix ('' if none)."""
-    parts = [s for s in rest.split("/") if s]
-    if not parts:
-        return ""
-    if prefix == "/r/pypi/":
-        name = parts[1] if parts[0] == "simple" and len(parts) > 1 else (parts[0] if parts[0] != "simple" else "")
-    elif prefix == "/r/pyfiles/":
-        m = re.match(r"(.+?)-\d", parts[-1])
-        name = m.group(1) if m else parts[-1]
-    elif prefix == "/r/npm/":
-        name = "/".join(parts[:2]) if parts[0].startswith("@") and len(parts) > 1 else parts[0]
-    elif prefix == "/r/crates-static/":
-        name = parts[1] if parts[0] == "crates" and len(parts) > 1 else ""
-    elif prefix == "/r/crates-index/":
-        name = "" if rest == "config.json" else parts[-1]
-    elif prefix == "/r/maven/":
-        if "." in parts[-1]:
-            parts = parts[:-1]
-        if len(parts) > 1 and re.match(r"\d", parts[-1]):
-            parts = parts[:-1]
-        name = "/".join(parts)
-    else:
-        name = parts[0]
-    return name
-PROXY_MAX_CONNS = 32
-PROXY_MAX_UPSTREAM = 8
-PROXY_CLIENT_TIMEOUT = 30
-PROXY_HEADER_DEADLINE = 60
-PROXY_RUN_BUDGET = 4 * 1024 ** 3
-PROXY_REWRITE_CAP = 64 * 1024 * 1024
 OUTPUT_RING = 64 * 1024
-SENSITIVE_DIRS = {".claude", ".github", ".husky", ".githooks", ".vscode", ".idea", ".cargo", ".mvn"}
+SENSITIVE_DIRS = {".claude", ".github", ".husky", ".githooks", ".vscode", ".idea", ".cargo", ".mvn", ".codex"}
 SENSITIVE_BASENAMES = {"Makefile", "package.json", "conftest.py", "setup.py", "build.rs", ".envrc",
                        ".pre-commit-config.yaml", "pyproject.toml", "setup.cfg", "sitecustomize.py",
                        "usercustomize.py", "Justfile", "Rakefile", "Dockerfile", ".npmrc",
@@ -199,7 +123,7 @@ def sanitize_untrusted_ex(text, limit=UNTRUSTED_LIMIT):
         cat = unicodedata.category(ch)
         if cat == "Cf":
             fmt += 1
-            kept.append("\u27e8U+%04X\u27e9" % ord(ch))
+            kept.append("⟨U+%04X⟩" % ord(ch))
         elif cat in ("Cc", "Cs", "Co", "Cn"):
             continue
         else:
@@ -218,7 +142,7 @@ def sanitize_untrusted(text, limit=UNTRUSTED_LIMIT):
 
 
 def estimate_cost(model, usage):
-    """USD estimate from the price table, or None for a model with no known price."""
+    """USD estimate from the price table, or None for a model with no known price (e.g. codex)."""
     price = PRICES.get(model)
     if not price:
         return None
@@ -229,7 +153,7 @@ def estimate_cost(model, usage):
 
 
 def sensitive_paths(paths):
-    """Paths whose change can run code outside the sandbox. Entries are worker-controlled: sanitize."""
+    """Paths whose change can run code outside a later build. Entries are worker-controlled: sanitize."""
     out = []
     for p in paths:
         parts = p.split("/")
@@ -258,8 +182,8 @@ def read_config(path=None):
 
 
 def list_workers(path=None):
-    """Named workers from config `workers`: {name: {"base_url", "model"[, "context_tokens"]}}. Malformed entries are
-    skipped; an out-of-range context_tokens is dropped."""
+    """Named claude/ollama workers from config `workers`: {name: {"base_url", "model"[, "context_tokens"]}}.
+    Malformed entries are skipped; an out-of-range context_tokens is dropped."""
     raw = read_config(path).get("workers")
     out = {}
     for name, w in (raw.items() if isinstance(raw, dict) else []):
@@ -282,6 +206,7 @@ def resolve_worker(name, path=None):
 def worker_up(base_url, model, timeout=3):
     """True if the Ollama behind base_url answers and has `model`. A dead tunnel, a stopped WSL or a missing model
     all read as down. /api/show reads the manifest only; it does not load the model."""
+    import urllib.request
     req = urllib.request.Request(base_url + "/api/show", data=json.dumps({"model": model}).encode(),
                                  headers={"Content-Type": "application/json"}, method="POST")
     try:
@@ -295,8 +220,8 @@ def resolve_base_url(requested=None, config_path=None):
     """Return {'url', 'host', 'port'}. Never reads the environment for the URL.
 
     The default is local ollama. Any other URL must be listed in `base_urls` (or be a worker's
-    `base_url`) in ~/.config/offload/config.json, and a non-loopback host must use https.
-    """
+    `base_url`) in ~/.config/offload/config.json, and a non-loopback host must use https. The worker
+    connects to this URL directly (there is no proxy), so a remote endpoint needs its own credential."""
     url = (requested or DEFAULT_BASE_URL).rstrip("/")
     parts = urlsplit(url)
     if parts.scheme not in ("http", "https") or not parts.hostname or parts.path or parts.query or parts.fragment:
@@ -313,7 +238,7 @@ def resolve_base_url(requested=None, config_path=None):
         allowed = allowed + [w["base_url"] for w in list_workers(path).values()]
         if url not in [str(a).rstrip("/") for a in allowed if isinstance(a, str)]:
             raise OffloadError(f"base URL {url!r} is not in the base_urls allowlist in {path}")
-    if host not in LOOPBACK_HOSTS and parts.scheme != "https":
+    if host not in {"localhost", "127.0.0.1", "::1"} and parts.scheme != "https":
         raise OffloadError(f"base URL {url!r}: a non-loopback host requires https")
     return {"url": url, "host": host, "port": port}
 
@@ -367,26 +292,57 @@ def compare_refs(before, after, slug):
     return bad
 
 
-# ----------------------------------------------------------------- claude binary
+# ----------------------------------------------------------------- worker binaries
+
+def _bin_version(real, args=("--version",)):
+    try:
+        p = subprocess.run([real, *args], capture_output=True, text=True, shell=False, cwd="/",
+                           env={"PATH": SAFE_PATH, "HOME": "/var/empty"}, timeout=30)
+        return p.stdout.strip().split()[0] if p.stdout.strip() else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
 
 def resolve_claude():
     link = shutil.which("claude")
     if not link:
         raise OffloadError("claude binary not found on PATH")
     real = os.path.realpath(link)
-    p = subprocess.run([real, "--version"], capture_output=True, text=True, shell=False, cwd="/",
-                       env={"PATH": SAFE_PATH, "HOME": "/var/empty"}, timeout=30)
-    version = p.stdout.strip().split()[0] if p.stdout.strip() else ""
-    return {"link": os.path.abspath(link), "real": real, "version": version}
+    return {"kind": "claude", "link": os.path.abspath(link), "real": real, "version": _bin_version(real)}
+
+
+def codex_home():
+    return os.path.join(real_home(), ".codex")
+
+
+def resolve_codex():
+    link = shutil.which("codex")
+    if not link:
+        raise OffloadError("codex binary not found on PATH; install codex and run `codex login`")
+    auth = os.path.join(codex_home(), "auth.json")
+    if not os.path.exists(auth):
+        raise OffloadError(f"no codex auth at {auth}; run `codex login` first")
+    real = os.path.realpath(link)
+    return {"kind": "codex", "link": os.path.abspath(link), "real": real, "version": _bin_version(real)}
 
 
 def build_claude_argv(claude_real, max_turns, add_dirs=()):
-    dirs = [a for d in add_dirs for a in ("--add-dir", d)]  # Claude Code's own path check, same dirs as the profile
+    dirs = [a for d in add_dirs for a in ("--add-dir", d)]
     return [claude_real, "-p", "--bare", "--strict-mcp-config", "--setting-sources", "",
             "--no-session-persistence", "--output-format", "stream-json", "--verbose",
             "--max-turns", str(int(max_turns)), "--permission-mode", "dontAsk", "--permission-prompts", "none",
             "--tools", ",".join(ALLOWED_TOOLS), "--allowedTools", ",".join(ALLOWED_TOOLS),
             "--disallowedTools", ",".join(DENIED_TOOLS), "--disable-slash-commands", *dirs]
+
+
+def build_codex_argv(codex_real, src, model, last_msg_path):
+    """codex exec, non-interactive, writing JSONL to stdout and the final message to a file. Workspace-write
+    confines its shell writes to `src` + temp; its user config/hooks/rules are ignored (auth still used)."""
+    argv = [codex_real, "exec", "--json", "--skip-git-repo-check", "--ignore-user-config", "--ignore-rules",
+            "--color", "never", "-C", src, "-s", "workspace-write", "-o", last_msg_path]
+    if model:
+        argv += ["-m", model]
+    return argv
 
 
 def clt_bin_dir():
@@ -400,79 +356,47 @@ def clt_bin_dir():
 
 
 def worker_path(clt):
-    """User toolchains first (Homebrew: current python3 and git, no xcrun shim), then the CLT, then the system.
-    The helper's own git keeps SAFE_PATH."""
+    """User toolchains first (Homebrew: current python3 and git, no xcrun shim), then the CLT, then the system."""
     head = ["/opt/homebrew/bin", "/usr/local/bin"] + ([clt] if clt else [])
     rest = [d for d in SAFE_PATH.split(":") if d not in head]
     return ":".join(head + rest)
 
 
-def go_modcache(allow_read, home=None):
-    """The real ~/go/pkg/mod if --allow-read named it, else None."""
-    root = os.path.realpath(os.path.join(home or real_home(), "go", "pkg", "mod"))
-    return root if any(os.path.realpath(p) == root for p in allow_read) else None
-
-
-def build_worker_env(run_dir, model, base_url, max_thinking=DEFAULT_MAX_THINKING, lang=None, allow_read=(),
-                     registries=(), context_tokens=None):
-    """Exactly the spec's key set. Nothing is inherited from os.environ except an optional LANG.
-
-    base_url is the local proxy (P); the registry settings point at P/r/... and work only while it is up."""
+def build_worker_env(ctx):
+    """The environment the worker runs with. Network is open (no proxy). Nothing is inherited from
+    os.environ except an optional LANG. The worker is not jailed, so this only steers config and tooling."""
+    run_dir = ctx["run_dir"]
     tmp = os.path.join(run_dir, "tmp")
-    clt = clt_bin_dir()
     env = {
-        "PATH": worker_path(clt),
+        "PATH": worker_path(clt_bin_dir()),
         "PYTHONDONTWRITEBYTECODE": "1",
         "HOME": os.path.join(run_dir, "home"),
-        "LANG": lang or os.environ.get("LANG") or "en_US.UTF-8",
-        "TMPDIR": tmp, "CLAUDE_CODE_TMPDIR": tmp, "TMPPREFIX": os.path.join(tmp, "zsh"),
-        "CLAUDE_CONFIG_DIR": os.path.join(run_dir, "config"),
+        "LANG": os.environ.get("LANG") or "en_US.UTF-8",
+        "TMPDIR": tmp, "TMPPREFIX": os.path.join(tmp, "zsh"),
+        "USER": getpass.getuser(), "LOGNAME": getpass.getuser(),
         "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
-        "ANTHROPIC_BASE_URL": base_url, "ANTHROPIC_API_KEY": "ollama",
-        "ANTHROPIC_MODEL": model, "ANTHROPIC_SMALL_FAST_MODEL": model,
-        "ANTHROPIC_DEFAULT_OPUS_MODEL": model, "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
-        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-        "MAX_THINKING_TOKENS": str(int(max_thinking)),
-        "CARGO_HOME": os.path.join(run_dir, "home", ".cargo"),
-        "USER": getpass.getuser(), "LOGNAME": getpass.getuser(),  # xcodegen and others refuse to run without one
-        "UV_PYTHON_DOWNLOADS": "never",  # python builds come from github, which the proxy does not serve
-        "GOPROXY": "off", "GOFLAGS": "-mod=mod", "GOSUMDB": "off", "GOCACHE": os.path.join(tmp, "gocache"),
     }
-    # package registries, through the proxy's read-only routes, only for the ones enabled for this run
-    if "pypi" in registries:
-        env.update(PIP_INDEX_URL=f"{base_url}/r/pypi/simple", PIP_TRUSTED_HOST="127.0.0.1",
-                   UV_DEFAULT_INDEX=f"{base_url}/r/pypi/simple", UV_INSECURE_HOST="127.0.0.1")  # uv ignores the PIP_* ones
-    if "npm" in registries:
-        env["NPM_CONFIG_REGISTRY"] = f"{base_url}/r/npm/"
-    mod = go_modcache(allow_read)
-    if mod:
-        env["GOMODCACHE"] = mod
-    if context_tokens:  # a worker's real window, so Claude Code compacts before the model runs out (it assumes 200k)
-        env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(int(context_tokens))
+    if ctx["kind"] == "codex":
+        # codex reads its subscription auth from CODEX_HOME even with --ignore-user-config.
+        env["CODEX_HOME"] = codex_home()
+    else:
+        env.update({
+            "CLAUDE_CODE_TMPDIR": tmp,
+            "CLAUDE_CONFIG_DIR": os.path.join(run_dir, "config"),
+            "ANTHROPIC_BASE_URL": ctx["base"]["url"], "ANTHROPIC_API_KEY": "ollama",
+            "ANTHROPIC_MODEL": ctx["model"], "ANTHROPIC_SMALL_FAST_MODEL": ctx["model"],
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": ctx["model"], "ANTHROPIC_DEFAULT_SONNET_MODEL": ctx["model"],
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": ctx["model"],
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            "MAX_THINKING_TOKENS": str(int(ctx.get("max_thinking") or DEFAULT_MAX_THINKING)),
+        })
+        if ctx.get("context_tokens"):
+            env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(int(ctx["context_tokens"]))
     return env
 
 
-def write_registry_configs(run_dir, proxy_url, registries=()):
-    """Helper-written cargo config and maven settings, both pointing at the proxy (run-flow step 5)."""
-    home = os.path.join(run_dir, "home")
-    os.makedirs(os.path.join(home, ".cargo"), exist_ok=True)
-    os.makedirs(os.path.join(home, ".m2"), exist_ok=True)
-    if "crates" in registries:
-        with open(os.path.join(home, ".cargo", "config.toml"), "w") as f:
-            f.write('[source.crates-io]\nreplace-with = "offload"\n\n'
-                    f'[source.offload]\nregistry = "sparse+{proxy_url}/r/crates-index/"\n')
-    if "maven" in registries:
-        with open(os.path.join(home, ".m2", "settings.xml"), "w") as f:
-            f.write('<settings>\n  <mirrors>\n    <mirror>\n      <id>offload</id>\n      <mirrorOf>*</mirrorOf>\n'
-                    f'      <url>{proxy_url}/r/maven/</url>\n    </mirror>\n  </mirrors>\n</settings>\n')
-
-
-WORKER_ENV_KEYS = frozenset(build_worker_env("/x", "m", "http://localhost:11434", registries=tuple(REGISTRY_GROUPS)).keys())
-
-
 def check_init(event, allowed_tools=ALLOWED_TOOLS):
-    """Return a list of violations in the stream's system/init event (empty means fine)."""
+    """Violations in a Claude Code stream's system/init event (empty means fine)."""
     problems = []
     if event.get("mcp_servers") != []:
         problems.append(f"mcp_servers is {event.get('mcp_servers')!r}, expected []")
@@ -488,792 +412,7 @@ def check_init(event, allowed_tools=ALLOWED_TOOLS):
     return problems
 
 
-# ---------------------------------------------------------------- sandbox profile
-
-def sbpl_str(path):
-    """A quoted SBPL string literal. Rejects characters that cannot be escaped safely."""
-    if '"' in path or "\\" in path or any(ord(c) < 32 or ord(c) == 127 for c in path):
-        raise OffloadError(f"path cannot be used in a sandbox profile (quote, backslash or control char): {path!r}")
-    return f'"{path}"'
-
-
-def _ancestors(path):
-    parts = [p for p in path.split("/") if p]
-    out = ["/"]
-    for i in range(1, len(parts)):
-        out.append("/" + "/".join(parts[:i]))
-    return out
-
-
-def _darwin_dir(name):
-    try:
-        p = subprocess.run(["/usr/bin/getconf", name], capture_output=True, text=True, shell=False)
-        d = p.stdout.strip()
-        return os.path.realpath(d).rstrip("/") + "/" if p.returncode == 0 and d else None
-    except OSError:
-        return None
-
-
-def user_temp_dir():
-    return _darwin_dir("DARWIN_USER_TEMP_DIR")
-
-
-def user_cache_dir():
-    return _darwin_dir("DARWIN_USER_CACHE_DIR")
-
-
-def temp_roots(temp_dir="auto", cache_dir="auto"):
-    """The scratch dirs the worker may use: /private/tmp and the user's temp and cache dirs (no trailing /)."""
-    t = user_temp_dir() if temp_dir == "auto" else temp_dir
-    c = user_cache_dir() if cache_dir == "auto" else cache_dir
-    return ["/private/tmp"] + [d.rstrip("/") for d in (t, c) if d]
-
-
-def snapshot_temp_entries(roots):
-    """Top-level entry names of each root, taken at run start. The worker gets none of these (only what it creates)."""
-    out = {}
-    for r in roots:
-        try:
-            out[r] = sorted(os.listdir(r))
-        except OSError as e:
-            raise OffloadError(f"cannot list {r} for the sandbox snapshot: {e}")
-    return out
-
-
-def parse_netstat_listeners(text):
-    """TCP LISTEN ports from `netstat -anv -p tcp` text: `127.0.0.1.4410`, `::1.18080`, `*.80` (tcp4/tcp6/tcp46)."""
-    ports = set()
-    for ln in text.splitlines():
-        f = ln.split()
-        if len(f) > 5 and f[0].startswith("tcp") and f[5] == "LISTEN":
-            tail = f[3].rsplit(".", 1)[-1]
-            if tail.isdigit():
-                ports.add(int(tail))
-    return ports
-
-
-def parse_lsof_listeners(text):
-    """TCP LISTEN ports from `lsof -nP -iTCP -sTCP:LISTEN -Fn` text: `n*:53643`, `n127.0.0.1:4410`, `n[::1]:18080`."""
-    ports = set()
-    for ln in text.splitlines():
-        tail = ln.rsplit(":", 1)[-1] if ln.startswith("n") else ""
-        if tail.isdigit():
-            ports.add(int(tail))
-    return ports
-
-
-def _listeners(argv, parse):
-    try:
-        p = subprocess.run(argv, capture_output=True, text=True, shell=False, timeout=30)
-    except (OSError, subprocess.TimeoutExpired):
-        return set()
-    return parse(p.stdout) if p.returncode == 0 else set()
-
-
-def snapshot_listen_ports():
-    """Every TCP listener on the host (any owner, no root needed). Fails closed: an empty snapshot is an error.
-    Under a non-Apple python (Homebrew, uv) the kernel hides every socket from netstat, so fall back to lsof,
-    which still sees this user's listeners but not root's (e.g. launchd's 8021): those are left unprotected."""
-    ports = _listeners(["/usr/sbin/netstat", "-anv", "-p", "tcp"], parse_netstat_listeners)
-    if not ports:
-        ports = _listeners(["/usr/sbin/lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fn"], parse_lsof_listeners)
-    if not ports:
-        raise OffloadError("cannot snapshot host listeners (netstat and lsof failed or found none)")
-    return ports
-
-
-def _re_text(text):
-    """text as an ERE fragment. A character that cannot go in an SBPL regex string becomes [^/]*, which only
-    over-matches (denies more)."""
-    out = []
-    for c in text:
-        if not (c.isascii() and c.isprintable()) or c in '"\\':
-            out.append("[^/]*")
-        else:
-            out.append(c if c.isalnum() or c in "_-/" else "\\" + c)
-    return "".join(out)
-
-
-REGEX_BUDGET = 900  # sandbox-exec rejects a regex string over 1024 characters (measured: 1019 fails, 999 works)
-# sandbox-exec also caps the whole compiled profile (65535 bytes: "data object length ... exceeds maximum").
-# Measured on this Mac, the cap is hit at ~55k trie nodes of deny patterns (about 1000 UUID-style names), and the
-# <T> dir alone has ~8.7k entries. So the snapshot is shortened to name prefixes until it fits this budget.
-TRIE_NODE_BUDGET = 38000
-PREFIX_LADDER = (None, 24, 16, 12, 10, 8, 6, 5)  # longest first; the shortest still keeps 5 chars of every name
-
-
-def _trie_nodes(items):
-    """Characters in the prefix trie of items: the size proxy for the compiled regex."""
-    n, prev = 0, ""
-    for it in sorted(set(items)):
-        c = 0
-        while c < min(len(it), len(prev)) and it[c] == prev[c]:
-            c += 1
-        n += len(it) - c
-        prev = it
-    return n
-
-
-def shorten_entries(entries, budget=TRIE_NODE_BUDGET):
-    """Fit the snapshot under the node budget. Returns ({root: [(prefix, exact)]}, prefix length used). A name longer
-    than the cut becomes a prefix pattern (exact False), which only over-denies. Raises if even the shortest does not fit."""
-    for L in PREFIX_LADDER:
-        out = {r: sorted({(n, True) if L is None or len(n) <= L else (n[:L], False) for n in names})
-               for r, names in entries.items()}
-        if sum(_trie_nodes(p for p, _ in v) for v in out.values()) <= budget:
-            return out, L
-    raise OffloadError("the scratch-dir snapshot is too large for a sandbox profile even as 5-character prefixes")
-
-
-def entry_deny_rules(root, items, budget=REGEX_BUDGET):
-    """SBPL rules denying each existing entry of root, and everything below it, as size-capped regex alternations.
-    items are (name, exact) pairs; a non-exact name is a prefix."""
-    head, tail = f'(deny file-read* file-write* (regex #"^{_re_text(root)}/(', ')(/|$)"))'
-    rules, cur, size = [], [], 0
-    for name, exact in items:
-        frag = _re_text(name) + ("" if exact else "[^/]*")
-        if cur and size + len(frag) + 1 > budget - len(head):
-            rules.append(head + "|".join(cur) + tail)
-            cur, size = [], 0
-        cur.append(frag)
-        size += len(frag) + 1
-    if cur:
-        rules.append(head + "|".join(cur) + tail)
-    return rules
-
-
-def temp_rules(roots, entries, temp_dir, cache_dir, keep=None):
-    """The scratch-dir rules, last in the profile so they win: allow the roots, deny what existed at run start,
-    then the always-denied names (Claude's own files, planted-config names, xcrun's cache db)."""
-    rs = [sbpl_str(r) for r in roots]
-    alt = "|".join(_re_text(r) for r in roots)
-    rules = ["(allow file-read* file-write* " + " ".join(f"(subpath {r})" for r in rs) + ")"]
-    shortened, _ = shorten_entries({r: entries.get(r, []) for r in roots})
-    for r in roots:
-        rules += entry_deny_rules(r, shortened[r])
-    claude_names = [("/private/tmp/", ["claude"])]
-    if temp_dir:
-        claude_names.append((temp_dir.rstrip("/") + "/", ["claude", "ccd-", "com.anthropic."]))
-    if cache_dir:
-        claude_names.append((cache_dir.rstrip("/") + "/", ["claude", "com.anthropic."]))
-    rules.append("(deny file-read* file-write* " + " ".join(
-        f'(regex #"^{_re_text(base + n)}")' for base, ns in claude_names for n in ns) + ")")
-    rules.append(f'(deny file-write* (regex #"^({alt})(/.*)?/(\\.git|\\.claude|CLAUDE(\\.local)?\\.md|HEAD)(/|$)") '
-                 f'(regex #"^({alt})/node_modules(/|$)"))')
-    # `subpath` includes the root itself: without this the worker could chmod it or add an inheritable ACE.
-    rules.append("(deny file-write* " + " ".join(f"(literal {r})" for r in rs) + ")")
-    if temp_dir:
-        rules.append(f'(deny file-read* file-write* (literal {sbpl_str(temp_dir.rstrip("/") + "/xcrun_db")}))')
-    # The run's own paths win over the snapshot if they sit under a root (only when --home points there, as in tests).
-    under = lambda ps: [p for p in ps if any(p == r or p.startswith(r + "/") for r in roots)]
-    k = keep or {}
-    keep_rules = []
-    for verb, ps in (("file-read-metadata", under(k.get("meta", []))), ("file-read*", under(k.get("read", []))),
-                     ("file-write*", under(k.get("write", [])))):
-        if ps:
-            keep_rules.append(f"(allow {verb} " + " ".join(f"(subpath {sbpl_str(x)})" if verb != "file-read-metadata"
-                                                       else f"(literal {sbpl_str(x)})" for x in ps) + ")")
-    return rules + keep_rules
-
-
-def allow_read_roots(home, repo_root=None):
-    """The allowed --allow-read roots as (real root, containing dir) pairs. A root whose real path
-    leaves its containing dir ($HOME or the repo), such as a symlinked node_modules, is not allowed."""
-    roots = [(os.path.realpath(os.path.join(home, r)), os.path.realpath(home)) for r in ALLOW_READ_HOME]
-    if repo_root:
-        rr = os.path.realpath(repo_root)
-        roots += [(os.path.realpath(os.path.join(rr, r)), rr) for r in ALLOW_READ_REPO]
-    return roots
-
-
-def validate_allow_read(path, home=None, repo_root=None):
-    """Allowlist check on the real path (symlinks resolved). Returns the real path."""
-    home = os.path.realpath(home or real_home())
-    real = os.path.realpath(os.path.expanduser(path))
-    roots = allow_read_roots(home, repo_root)
-    for root, within in roots:
-        if is_under(real, root) and is_under(root, within):
-            return real
-    names = [f"~/{r}" for r in ALLOW_READ_HOME] + [f"<repo>/{r}" for r in ALLOW_READ_REPO]
-    raise OffloadError(f"--allow-read {path!r} (resolves to {real}) is not on the allowlist: {', '.join(names)}")
-
-
-def default_read_roots(home=None, repo_root=None):
-    """The DEFAULT_READ_HOME roots that exist and pass validate_allow_read, plus a warning for each that
-    exists but fails it (such as a symlink leaving $HOME). A failing default never fails the run."""
-    home = home or real_home()
-    roots, warnings = [], []
-    for rel in DEFAULT_READ_HOME:
-        path = os.path.join(home, rel)
-        if not os.path.lexists(path):
-            continue
-        try:
-            roots.append(validate_allow_read(path, home=home, repo_root=repo_root))
-        except OffloadError as e:
-            warnings.append(f"default read root ~/{rel} skipped: {e}")
-    return roots, warnings
-
-
-def generate_profile(run_dir, claude_real, claude_link=None, allow_read=(), repo_root=None,
-                     home=None, temp_dir="auto", cache_dir="auto", proxy_port=None, src_dir=None,
-                     temp_entries=None, host_ports=()):
-    """Build the SBPL text. Later rules win, so narrower allows follow the broad denies.
-
-    With no proxy_port all network is denied. With one, the worker may bind, listen and connect over TCP on any
-    loopback port (user decision 2026-10-29; sandbox-exec cannot block single ports: 18 of 30 denies leaked).
-    host_ports (listeners at run start) and the proxy port cannot be bound by the worker: a bind deny after the
-    wildcard allow is enforced (30 of 30), unlike a connect deny. This stops a SO_REUSEADDR takeover of a host
-    wildcard listener's loopback clients. temp_entries ({root: names}) are the scratch-dir entries that existed at run start: the worker gets
-    none of them. Both snapshots are inputs so this stays pure.
-    src_dir is the writable code dir (RUN/src for the worker, RUN/testsrc-N for `test`)."""
-    home = home or real_home()
-    run_dir = os.path.realpath(run_dir)
-    claude_dir = os.path.dirname(os.path.realpath(claude_real))
-    src_dir = os.path.realpath(src_dir) if src_dir else os.path.join(run_dir, "src")
-    sub_reads = [src_dir] + [os.path.join(run_dir, d) for d in ("tmp", "home", "config")]
-    sub_reads += [os.path.realpath(p) for p in allow_read]
-    literal_reads = [os.path.join(run_dir, "profile.sb")]
-    if claude_link:
-        literal_reads.append(claude_link)
-
-    meta = []
-    for p in [run_dir, claude_dir, *sub_reads, *literal_reads]:
-        for a in _ancestors(p) + ([p] if p == run_dir else []):
-            if a not in meta:
-                meta.append(a)
-
-    if temp_dir == "auto":
-        temp_dir = user_temp_dir()
-    if cache_dir == "auto":
-        cache_dir = user_cache_dir()
-    roots = temp_roots(temp_dir, cache_dir)
-    for r in roots:
-        for a in _ancestors(r):
-            if a not in meta:
-                meta.append(a)
-    writes = [f"(subpath {sbpl_str(p)})" for p in sub_reads[:4]]
-    writes += ['(literal "/dev/null")', '(literal "/dev/tty")', '(regex #"^/dev/fd/")', '(regex #"^/dev/ttys")']
-
-    lines = [
-        "(version 1)",
-        "(allow default)",
-        "(deny file-read* (subpath {}) (subpath \"/private/tmp\") (subpath \"/private/var/folders\") "
-        "(subpath \"/Volumes\"))".format(sbpl_str(home)),
-    ]
-    if repo_root:
-        lines.append(f"(deny file-read* (subpath {sbpl_str(os.path.realpath(repo_root))}))")
-    lines += [
-        "(allow file-read-metadata " + " ".join(f"(literal {sbpl_str(m)})" for m in meta) + ")",
-        "(allow file-read* (subpath {}) {} {})".format(
-            sbpl_str(claude_dir),
-            " ".join(f"(literal {sbpl_str(p)})" for p in literal_reads),
-            " ".join(f"(subpath {sbpl_str(p)})" for p in sub_reads)),
-        f"(deny file-read* (subpath {sbpl_str(os.path.join(run_dir, 'git'))}) "
-        f"(literal {sbpl_str(os.path.join(run_dir, 'run.json'))}))",
-        '(deny file-write* (subpath "/"))',
-        "(allow file-write* " + " ".join(writes) + ")",
-        # IPC that reaches outside the sandbox: clipboard, LaunchServices (open), DNS, AppleEvents.
-        '(deny mach-lookup (global-name "com.apple.pasteboard.1") '
-        '(global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.lsd.mapdb") '
-        '(global-name "com.apple.lsd.modifydb") (global-name "com.apple.mDNSResponder") '
-        '(global-name "com.apple.SystemConfiguration.DNSConfiguration"))',
-        "(deny appleevent-send)",
-        "(deny network*)",
-    ]
-    lines += temp_rules(roots, temp_entries or {}, temp_dir, cache_dir,
-                        {"meta": meta, "read": sub_reads + literal_reads, "write": sub_reads[:4]})
-    if proxy_port:
-        # SBPL accepts only "*" or "localhost" as the host, and one port (no ranges); 127.0.0.1 is rejected.
-        # TCP only: UDP stays denied. Unix sockets stay denied.
-        proxy = int(proxy_port)
-        lines.append('(allow network-outbound (remote tcp "localhost:*"))')
-        if ALLOW_LISTEN:
-            lines.append('(allow network-bind network-inbound (local tcp "localhost:*"))')
-            taken = sorted({int(p) for p in host_ports} | {proxy})
-            lines.append("(deny network-bind network-inbound " + " ".join(f'(local tcp "localhost:{p}")' for p in taken) + ")")
-        lines.append(f'(allow network-outbound (remote tcp "localhost:{proxy}"))')  # redundant, kept so the order is clear
-    return "\n".join(lines) + "\n"
-
-
-# ------------------------------------------------------------------ egress proxy
-
-class UpstreamBlocked(OSError):
-    """An upstream connection the proxy refuses to make (a non-global address)."""
-
-
-# IPv6 forms that embed an IPv4 address (loopback, private) but that is_global can report as global.
-_EMBEDDED_V4 = [ipaddress.ip_network(n) for n in ("::/96", "::ffff:0:0/96", "64:ff9b::/96")]
-
-
-def _is_public_ip(addr):
-    ip = ipaddress.ip_address(addr.split("%")[0])
-    if ip.version == 6 and any(ip in n for n in _EMBEDDED_V4):
-        return False
-    return ip.is_global
-
-
-def connect_registry(host, port=443, resolver=socket.getaddrinfo, ssl_context=None, timeout=60):
-    """Open a verified TLS connection to a registry host. Every resolved address must be globally routable;
-    the connection goes to the vetted address (no second lookup) with SNI and certificate checks for `host`."""
-    infos = resolver(host, port, type=socket.SOCK_STREAM)
-    addrs = [i[4][0] for i in infos]
-    if not addrs or not all(_is_public_ip(a) for a in addrs):
-        raise UpstreamBlocked(f"{host} resolves to a non-global address")
-    ctx = ssl_context or ssl.create_default_context()
-
-    class Pinned(http.client.HTTPSConnection):
-        def connect(self):
-            last = None
-            for ip in addrs:  # only vetted addresses, in order; no second lookup
-                try:
-                    sock = socket.create_connection((ip, self.port), self.timeout)
-                    break
-                except OSError as e:
-                    last = e
-            else:
-                raise last
-            self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
-
-    return Pinned(host, port, context=ctx, timeout=timeout)
-
-
-class _ProxyServer(ThreadingHTTPServer):
-    """Caps concurrent connections: extras are accepted and closed at once, with a log line."""
-    daemon_threads = True
-    request_queue_size = 64
-
-    def __init__(self, addr, handler, proxy):
-        self.proxy = proxy
-        self._counted = set()
-        super().__init__(addr, handler)
-
-    def verify_request(self, request, client_address):
-        with self.proxy._lock:
-            if len(self._counted) >= self.proxy.max_conns:
-                full = True
-            else:
-                full = False
-                self._counted.add(request)
-        if full:
-            self.proxy.log_reject("CONN", "connection limit reached")
-        return not full
-
-    def shutdown_request(self, request):
-        with self.proxy._lock:
-            self._counted.discard(request)
-        super().shutdown_request(request)
-
-
-class EgressProxy:
-    """A filtering proxy on 127.0.0.1, run in the helper for the life of the worker.
-
-    It forwards only POST /v1/messages and POST /v1/messages/count_tokens to the configured upstream,
-    plus read-only GET/HEAD on the fixed registry routes (REGISTRY_ROUTES), and answers everything else
-    with 403, logging it to `reject_log`. There is no CONNECT: the helper makes every outbound TLS
-    connection itself, so it sees and filters the HTTP. The sandboxed worker's only network allow is this
-    port, so it can't reach other Ollama endpoints (pull, delete, ...).
-
-    `routes`, `connector` and the limits are injectable so tests can point routes at a local server."""
-
-    def __init__(self, upstream_url, reject_log, max_body=PROXY_MAX_BODY, routes=None, connector=None,
-                 max_conns=PROXY_MAX_CONNS, max_upstream=PROXY_MAX_UPSTREAM, header_deadline=PROXY_HEADER_DEADLINE,
-                 run_budget=PROXY_RUN_BUDGET, rewrite_cap=PROXY_REWRITE_CAP, upstream_wait=30, request_log=None, registries=()):
-        up = urlsplit(upstream_url)
-        self.scheme, self.host = up.scheme, up.hostname
-        self.port = up.port or (443 if up.scheme == "https" else 80)
-        self.reject_log, self.max_body = reject_log, max_body
-        self.routes = dict({p: REGISTRY_ROUTES[p] for n in registries for p in REGISTRY_GROUPS[n]}
-                           if routes is None else routes)
-        self.connector = connector or (lambda host, port, scheme: connect_registry(host, port))
-        self.max_conns, self.header_deadline = max_conns, header_deadline
-        self.run_budget, self.rewrite_cap, self.upstream_wait = run_budget, rewrite_cap, upstream_wait
-        self.downloaded = 0
-        self.request_log = request_log or os.path.join(os.path.dirname(reject_log) or ".", "registry_requests.log")
-        self.requests = 0
-        self.packages = []
-        self._slots = threading.BoundedSemaphore(max_upstream)
-        self._lock = threading.Lock()
-        self._conns = set()
-        self._socks = set()
-        self._stopped = False
-        self.httpd = _ProxyServer(("127.0.0.1", 0), self._handler(), self)
-        self.port_local = self.httpd.server_address[1]
-        self.url = f"http://127.0.0.1:{self.port_local}"
-        self._thread = None
-
-    def log_reject(self, method, path):
-        line = "%s %s %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S%z"), method[:16],
-                               path[:512].encode("unicode_escape").decode("ascii"))
-        with self._lock:
-            with open(self.reject_log, "a") as f:
-                f.write(line)
-
-    def log_request(self, method, path, status, nbytes, prefix, rest):
-        """One line per /r/ request in registry_requests.log, plus the count and distinct first segments."""
-        line = "%s %s %s %s %d\n" % (time.strftime("%Y-%m-%dT%H:%M:%S%z"), method[:16],
-                                     path[:512].encode("unicode_escape").decode("ascii"), status, nbytes)
-        seg = registry_package(prefix, rest)[:100].encode("unicode_escape").decode("ascii")
-        with self._lock:
-            self.requests += 1
-            if seg and seg not in self.packages and len(self.packages) < 50:
-                self.packages.append(seg)
-            with open(self.request_log, "a") as f:
-                f.write(line)
-
-    def registry_summary(self):
-        with self._lock:
-            return {"count": self.requests, "packages": list(self.packages)}
-
-    def _upstream(self):
-        cls = http.client.HTTPSConnection if self.scheme == "https" else http.client.HTTPConnection
-        return cls(self.host, self.port, timeout=PROXY_UPSTREAM_TIMEOUT)
-
-    # ---- registry helpers
-
-    def match_route(self, target):
-        """(prefix, upstream base, decoded rest, query) for a safe /r/ target, else None."""
-        path, _, query = target.partition("?")
-        for prefix, base in self.routes.items():
-            if path.startswith(prefix):
-                rest = path[len(prefix):]
-                break
-        else:
-            return None
-        try:
-            decoded = unquote(rest, errors="strict")  # once
-        except UnicodeDecodeError:
-            return None
-        if (decoded.startswith("/") or ".." in decoded or "//" in decoded or "\\" in decoded
-                or any(ord(c) < 32 or ord(c) == 127 for c in decoded)):
-            return None
-        if not re.fullmatch(r"[A-Za-z0-9%._~!$&'()*+,;=:@/?-]*", query):
-            return None
-        return prefix, base, decoded, query
-
-    def map_location(self, url):
-        """A table upstream URL as the matching proxy URL, or None if it points anywhere else."""
-        for prefix, base in self.routes.items():
-            if url.startswith(base):
-                return self.url + prefix + url[len(base):]
-        return None
-
-    def rewrite_for(self, prefix, rest, ctype):
-        """The body rewrite for this response: None, 'crates-config', or a (old, new) string pair."""
-        ctype = (ctype or "").lower()
-        if prefix == "/r/pypi/" and rest.startswith("simple/") and ("html" in ctype or "json" in ctype):
-            return ("https://files.pythonhosted.org/", self.url + "/r/pyfiles/")
-        if prefix == "/r/npm/" and "json" in ctype:
-            return ("https://registry.npmjs.org/", self.url + "/r/npm/")
-        if prefix == "/r/crates-index/" and rest == "config.json":
-            return "crates-config"
-        return None
-
-    def rewrite_body(self, rule, data):
-        if rule == "crates-config":
-            cfg = json.loads(data)
-            cfg["dl"] = self.url + "/r/crates-static/crates"
-            cfg["api"] = None
-            return json.dumps(cfg).encode()
-        old, new = rule
-        return data.replace(old.encode(), new.encode())
-
-    def _handler(self):
-        proxy = self
-
-        class Handler(BaseHTTPRequestHandler):
-            protocol_version = "HTTP/1.1"
-            timeout = PROXY_CLIENT_TIMEOUT
-
-            def log_message(self, *a):
-                pass
-
-            def setup(self):
-                super().setup()
-                with proxy._lock:
-                    if proxy._stopped:
-                        raise ConnectionError("proxy stopped")
-                    proxy._socks.add(self.request)
-
-            def finish(self):
-                with proxy._lock:
-                    proxy._socks.discard(self.request)
-                try:
-                    super().finish()
-                except OSError:
-                    pass
-
-            # 60 s to read a full request line and headers, however slowly the bytes arrive.
-            def handle_one_request(self):
-                timer = threading.Timer(proxy.header_deadline, self._deadline)
-                timer.daemon = True
-                self._timer = timer
-                timer.start()
-                try:
-                    super().handle_one_request()
-                finally:
-                    timer.cancel()
-
-            def _deadline(self):
-                self.close_connection = True
-                try:
-                    self.request.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
-
-            def send_response(self, code, message=None):
-                self._code = code
-                super().send_response(code, message)
-
-            def parse_request(self):
-                self._sent, self._code = 0, 0
-                ok = super().parse_request()
-                self._timer.cancel()
-                return ok
-
-            def _reply(self, code, text):
-                body = (text + "\n").encode()
-                self.close_connection = True
-                self._sent = getattr(self, "_sent", 0) + (0 if self.command == "HEAD" else len(body))
-                self.send_response(code)
-                self.send_header("Content-Type", "text/plain")
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Connection", "close")
-                self.end_headers()
-                if self.command != "HEAD":
-                    self.wfile.write(body)
-
-            def _reject(self):
-                proxy.log_reject(self.command, self.path)
-                self._reply(403, "forbidden by offload egress proxy")
-
-            do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_CONNECT = do_TRACE = _reject
-
-            def send_error(self, code, message=None, explain=None):
-                if code == 501:  # unknown method
-                    proxy.log_reject(self.command or "?", self.path or "?")
-                    self.close_connection = True
-                    return self._reply(403, "forbidden by offload egress proxy")
-                self.close_connection = True
-                super().send_error(code, message, explain)
-
-            def _read_body(self):
-                """Return the request body (<= max_body) or None after replying with an error."""
-                if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
-                    data = b""
-                    while True:
-                        size = int(self.rfile.readline(64).split(b";")[0].strip() or b"0", 16)
-                        if size == 0:
-                            while self.rfile.readline(1024) not in (b"\r\n", b"\n", b""):
-                                pass
-                            return data
-                        if len(data) + size > proxy.max_body:
-                            break
-                        data += self.rfile.read(size)
-                        self.rfile.readline(8)
-                else:
-                    try:
-                        n = int(self.headers.get("Content-Length", "0"))
-                    except ValueError:
-                        n = -1
-                    if 0 <= n <= proxy.max_body:
-                        return self.rfile.read(n)
-                proxy.log_reject(self.command, self.path + " [body too large or malformed]")
-                self._reply(413, "request body too large")
-                return None
-
-            def do_POST(self):
-                path = self.path.split("?", 1)[0]
-                if path not in PROXY_ALLOWED_PATHS:
-                    return self._reject()
-                try:
-                    body = self._read_body()
-                except (ValueError, OSError):
-                    self.close_connection = True
-                    return
-                if body is None:
-                    return
-                hdrs = {"Connection": "close"}
-                for k, v in self.headers.items():
-                    kl = k.lower()
-                    if kl in ("content-type", "accept", "user-agent", "authorization", "x-api-key") \
-                            or kl.startswith("anthropic-"):
-                        hdrs[k] = v
-                conn = proxy._upstream()
-                with proxy._lock:
-                    proxy._conns.add(conn)
-                try:
-                    try:
-                        conn.request("POST", self.path, body=body, headers=hdrs)
-                        resp = conn.getresponse()
-                    except (OSError, http.client.HTTPException) as e:
-                        return self._reply(502, f"upstream error: {type(e).__name__}")
-                    self.close_connection = True
-                    self.send_response(resp.status)
-                    for k, v in resp.getheaders():
-                        kl = k.lower()
-                        if kl in ("content-type", "request-id", "x-request-id") or kl.startswith("anthropic-"):
-                            self.send_header(k, v)
-                    self.send_header("Connection", "close")
-                    self.end_headers()
-                    while True:
-                        chunk = resp.read1(65536)
-                        if not chunk:
-                            break
-                        self.wfile.write(chunk)
-                        self.wfile.flush()
-                except OSError:
-                    pass  # client or upstream went away mid-stream
-                finally:
-                    with proxy._lock:
-                        proxy._conns.discard(conn)
-                    conn.close()
-
-            # ---- read-only registry routes
-
-            def do_GET(self):
-                route = self.path.startswith("/r/") and proxy.match_route(self.path)
-                has_body = (self.headers.get("Transfer-Encoding") is not None
-                            or self.headers.get("Content-Length", "0").strip() not in ("", "0"))
-                if not route or has_body:
-                    return self._reject()
-                try:
-                    if proxy.downloaded >= proxy.run_budget:
-                        proxy.log_reject(self.command, self.path + " [download budget used]")
-                        return self._reply(403, "download budget used")
-                    if not proxy._slots.acquire(timeout=proxy.upstream_wait):
-                        return self._reply(503, "too many upstream requests")
-                    try:
-                        self._registry(*route)
-                    finally:
-                        proxy._slots.release()
-                finally:
-                    proxy.log_request(self.command, self.path, self._code, self._sent, route[0], route[2])
-
-            do_HEAD = do_GET
-
-            def _registry(self, prefix, base, rest, query):
-                up = urlsplit(base)
-                port = up.port or (443 if up.scheme == "https" else 80)
-                upath = up.path.rstrip("/") + "/" + quote(rest, safe="/@:+,;=~!$&'()*-._")
-                if query:
-                    upath += "?" + query
-                hdrs = {"User-Agent": "offload", "Accept-Encoding": "identity", "Connection": "close",
-                        "Accept": self.headers.get("Accept", "*/*")}
-                for k in ("If-None-Match", "If-Modified-Since"):
-                    if self.headers.get(k):
-                        hdrs[k] = self.headers[k]
-                conn = None
-                try:
-                    try:
-                        conn = proxy.connector(up.hostname, port, up.scheme)
-                        with proxy._lock:
-                            proxy._conns.add(conn)
-                        conn.request(self.command, upath, headers=hdrs)
-                        resp = conn.getresponse()
-                    except (OSError, http.client.HTTPException, ssl.SSLError) as e:
-                        return self._reply(502, f"upstream error: {type(e).__name__}")
-                    self.close_connection = True
-                    if resp.status in (301, 302, 303, 307, 308):
-                        loc = resp.getheader("Location")
-                        mapped = (proxy.map_location(urljoin(f"{up.scheme}://{up.netloc}{upath}", loc))
-                                  if loc else None)
-                        if not mapped:
-                            return self._reply(502, "redirect to a host that is not routed")
-                        self.send_response(resp.status)
-                        self.send_header("Location", mapped)
-                        self.send_header("Content-Length", "0")
-                        self.send_header("Connection", "close")
-                        return self.end_headers()
-                    ctype = resp.getheader("Content-Type")
-                    rule = proxy.rewrite_for(prefix, rest, ctype) if resp.status == 200 else None
-                    if rule and resp.getheader("Content-Encoding", "identity").lower() != "identity":
-                        return self._reply(502, "encoded body cannot be rewritten")
-                    data = None
-                    if rule and self.command != "HEAD":
-                        data = resp.read(proxy.rewrite_cap + 1)
-                        with proxy._lock:
-                            proxy.downloaded += len(data)  # every byte read from upstream counts
-                        if len(data) > proxy.rewrite_cap:
-                            return self._reply(502, "metadata too large to rewrite")
-                        try:
-                            data = proxy.rewrite_body(rule, data)
-                        except ValueError:
-                            return self._reply(502, "metadata could not be rewritten")
-                    self.send_response(resp.status)
-                    for k in ("Content-Type", "ETag", "Last-Modified", "Cache-Control"):
-                        if resp.getheader(k):
-                            self.send_header(k, resp.getheader(k))
-                    self.send_header("Connection", "close")
-                    if rule:  # the body changes, so the upstream length no longer applies
-                        if data is not None:
-                            self.send_header("Content-Length", str(len(data)))
-                        self.end_headers()
-                        if data is not None:
-                            self._send_counted(data, count=False)
-                        return
-                    if resp.getheader("Content-Length"):
-                        self.send_header("Content-Length", resp.getheader("Content-Length"))
-                    self.end_headers()
-                    if self.command == "HEAD":
-                        return
-                    while True:
-                        chunk = resp.read1(65536)
-                        if not chunk:
-                            break
-                        self._send_counted(chunk)
-                        if proxy.downloaded >= proxy.run_budget:
-                            break
-                except OSError:
-                    pass
-                finally:
-                    if conn is not None:
-                        with proxy._lock:
-                            proxy._conns.discard(conn)
-                        conn.close()
-
-            def _send_counted(self, chunk, count=True):
-                if count:
-                    with proxy._lock:
-                        proxy.downloaded += len(chunk)
-                self._sent += len(chunk)
-                self.wfile.write(chunk)
-                self.wfile.flush()
-
-        return Handler
-
-    def start(self):
-        self._thread = threading.Thread(target=self.httpd.serve_forever, kwargs={"poll_interval": 0.2}, daemon=True)
-        self._thread.start()
-        return self.port_local
-
-    def stop(self):
-        """Stop listening and drop every open connection, in flight or idle."""
-        with self._lock:
-            self._stopped = True
-            conns, socks = list(self._conns), list(self._socks)
-        if self._thread:
-            self.httpd.shutdown()
-        self.httpd.server_close()
-        for c in conns:
-            try:
-                c.close()
-            except OSError:
-                pass
-        for sk in socks:
-            try:
-                sk.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-
-    def __enter__(self):
-        self.start()
-        return self
-
-    def __exit__(self, *exc):
-        self.stop()
-
-
-# ------------------------------------------------------------------ work area
+# -------------------------------------------------------------------- work area
 
 def extract_tar_safely(fileobj, dest):
     """Extract a tar stream with member path checks (no shell pipe, no links out of dest)."""
@@ -1327,7 +466,7 @@ def write_run_json(run_dir, record):
     try:
         with os.fdopen(fd, "w") as f:
             json.dump(record, f, indent=2, sort_keys=True)
-        os.chmod(tmp, 0o600)  # O_CREAT mode is ignored if a stale tmp already existed
+        os.chmod(tmp, 0o600)
         os.replace(tmp, os.path.join(run_dir, "run.json"))
     except BaseException:
         try:
@@ -1341,7 +480,7 @@ RUN_JSON_MIN_INTERVAL_S = 2.0
 
 
 def sum_usage(per_msg):
-    """{input, cache_read, output} summed over per-message usage dicts (Ollama sends null for missing fields)."""
+    """{input, cache_read, output} summed over per-message usage dicts (null fields read as 0)."""
     tot = lambda k: sum(int(u.get(k) or 0) for u in per_msg)
     return {"input": tot("input_tokens"), "cache_read": tot("cache_read_input_tokens"), "output": tot("output_tokens")}
 
@@ -1388,49 +527,29 @@ def check_branch_free(repo, slug, home):
         raise OffloadError(f"refs/heads/offload/{slug}/ has branches under it in {repo}")
 
 
-def write_profile(ctx, proxy_port=None, src_dir=None, path=None):
-    claude = ctx.get("claude")
-    # Scratch-dir entries at run start (kept in ctx so a rewrite of the profile keeps the same snapshot).
-    if "temp_entries" not in ctx:
-        ctx["temp_entries"] = snapshot_temp_entries(temp_roots())
-    text = generate_profile(ctx["run_dir"], claude["real"] if claude else "/usr/bin/true",
-                            claude["link"] if claude else None, ctx.get("allow_read", ()),
-                            repo_root=ctx["repo"], proxy_port=proxy_port, src_dir=src_dir,
-                            temp_entries=ctx["temp_entries"], host_ports=ctx.get("host_ports") or ())
-    with open(path or ctx["profile"], "w") as f:
-        f.write(text)
-
-
-def prepare_run(repo, slug, ohome, model=DEFAULT_MODEL, base=None, claude=None, allow_read=(),
-                max_thinking=DEFAULT_MAX_THINKING, max_turns=DEFAULT_MAX_TURNS, registries=()):
-    """Run-flow steps 1 (partly), 2, 3 and the profile of step 4. Returns the run context.
-
-    The profile written here has no network allow; cmd_run rewrites it once the proxy port is known."""
+def prepare_run(repo, slug, ohome, kind, worker_bin, model=None, base=None, max_thinking=DEFAULT_MAX_THINKING,
+                max_turns=DEFAULT_MAX_TURNS, context_tokens=None):
+    """Build the isolated work area and the run record. Returns the run context."""
     validate_slug(slug)
-    if not MODEL_RE.match(model):
+    if model and not MODEL_RE.match(model):
         raise OffloadError(f"invalid model name {model!r}")
     os.makedirs(ohome, mode=0o700, exist_ok=True)
     root = validate_repo(repo, ohome)
-    base = base or resolve_base_url()
     run_id = run_id_for(root, slug)
     run_dir = os.path.join(ohome, "runs", run_id)
     if os.path.lexists(run_dir):
         raise OffloadError(f"run directory already exists: {run_dir}")
-    allow = [validate_allow_read(p, repo_root=root) for p in allow_read]
-    defaults, warnings = default_read_roots(repo_root=root)
-    allow += [d for d in defaults if d not in allow]
     check_branch_free(root, slug, "/var/empty")
     os.makedirs(os.path.dirname(run_dir), mode=0o700, exist_ok=True)
     os.mkdir(run_dir, 0o700)
     for d in ("src", "tmp", "home", "config"):
         os.mkdir(os.path.join(run_dir, d), 0o700)
     ghome = os.path.join(run_dir, "home")
-    ctx = {"run_id": run_id, "run_dir": run_dir, "repo": root, "slug": slug, "model": model, "base": base,
-           "claude": claude, "allow_read": allow, "max_thinking": max_thinking, "max_turns": max_turns,
-           "registries": list(registries),
+    ctx = {"run_id": run_id, "run_dir": run_dir, "repo": root, "slug": slug, "kind": kind, "model": model,
+           "base": base, "worker_bin": worker_bin, "max_thinking": max_thinking, "max_turns": max_turns,
+           "context_tokens": context_tokens,
            "git_dir": os.path.join(run_dir, "git"), "src": os.path.join(run_dir, "src"),
-           "profile": os.path.join(run_dir, "profile.sb"), "ghome": ghome, "proxy_port": None,
-           "warnings": warnings}
+           "ghome": ghome}
     try:
         ctx["base_sha"] = safe_git(["-C", root, "rev-parse", "HEAD"], ghome).stdout.strip()
         safe_git(["clone", "--bare", "--no-local", "--no-hardlinks", root, ctx["git_dir"]], ghome)
@@ -1442,25 +561,20 @@ def prepare_run(repo, slug, ohome, model=DEFAULT_MODEL, base=None, claude=None, 
             raise OffloadError(f"git archive failed: {err.decode(errors='replace')[:300]}")
         safe_git(["--git-dir", ctx["git_dir"], "branch", "work", ctx["base_sha"]], ghome)
         safe_git(["--git-dir", ctx["git_dir"], "symbolic-ref", "HEAD", "refs/heads/work"], ghome)
-        write_profile(ctx)
     except BaseException:
         shutil.rmtree(run_dir, ignore_errors=True)
         raise
-    ctx["record"] = {"run_id": run_id, "run_dir": run_dir, "repo": root, "slug": slug, "model": model,
-                     "branch": f"offload/{slug}", "base_sha": ctx["base_sha"], "base_url": base["url"],
-                     "status": "prepared", "created": time.time(), "max_turns": max_turns,
-                     "claude": claude, "allow_read": allow, "warnings": warnings,
-                     "registries": list(registries),
-                     # The Claude Code session that started the run, so squad shows it only there.
+    ctx["record"] = {"run_id": run_id, "run_dir": run_dir, "repo": root, "slug": slug, "kind": kind,
+                     "model": model, "branch": f"offload/{slug}", "base_sha": ctx["base_sha"],
+                     "base_url": base["url"] if base else None, "status": "prepared", "created": time.time(),
+                     "max_turns": max_turns, "worker": worker_bin, "context_window": context_tokens,
                      "session_id": os.environ.get("CLAUDE_CODE_SESSION_ID")}
     write_run_json(run_dir, ctx["record"])
     return ctx
 
 
 def init_worker_git(ctx):
-    """Give the worker a local repo in src: init and a `base` commit through the safe-git wrapper, with
-    --git-dir src/.git --work-tree src so the safe-git config applies. The helper never runs git against
-    src/.git after this; commit_work deletes it before collecting."""
+    """Give the worker a local repo in src: init and a `base` commit through the safe-git wrapper."""
     gh = ctx["ghome"]
     gd = os.path.join(ctx["src"], ".git")
     git = ["--git-dir", gd, "--work-tree", ctx["src"]]
@@ -1472,228 +586,8 @@ def init_worker_git(ctx):
     safe_git(git + ["commit", "-q", "--no-verify", "--allow-empty", "-m", "base"], gh)
 
 
-def sandbox_argv(profile, argv):
-    return [SANDBOX_EXEC, "-f", profile, *argv]
-
-
-def worker_url(ctx):
-    """The URL the sandboxed process is told to use: the local proxy, or an unreachable placeholder."""
-    return f"http://127.0.0.1:{ctx.get('proxy_port') or 1}"
-
-
-def _probe_conn_limit(port, limit=PROXY_MAX_CONNS):
-    """Hold `limit` idle connections to the proxy; the next one must be closed by the proxy at once."""
-    time.sleep(0.3)  # let earlier probe connections drain
-    held = []
-    try:
-        for _ in range(limit):
-            held.append(socket.create_connection(("127.0.0.1", port), timeout=3))
-        extra = socket.create_connection(("127.0.0.1", port), timeout=3)
-        held.append(extra)
-        extra.settimeout(3)
-        try:
-            closed = extra.recv(1) == b""
-        except socket.timeout:
-            closed = False
-        except OSError:
-            closed = True
-        return closed, "closed" if closed else "left open"
-    except OSError as e:
-        return False, f"{type(e).__name__}"
-    finally:
-        for c in held:
-            c.close()
-
-
-# Run inside the sandbox: one JSON object of network probe outcomes (True means the operation succeeded).
-_NET_PROBE = r"""
-import json, socket, sys
-proxy = int(sys.argv[1])
-taken = [int(a) for a in sys.argv[2:]]
-r = {}
-def tcp(port, timeout=2):
-    c = socket.socket(); c.settimeout(timeout); c.connect(("127.0.0.1", port)); c.close()
-def attempt(name, f):
-    try:
-        f(); r[name] = True
-    except Exception:
-        r[name] = False
-def own():
-    s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen(); tcp(s.getsockname()[1]); s.close()
-def udp():
-    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.sendto(b"x", ("127.0.0.1", 9))
-def take(port):
-    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", port)); s.listen()
-for t in [proxy] + taken:
-    attempt("take%d" % t, lambda: take(t))
-attempt("listen_connect", own)
-attempt("udp", udp)
-attempt("proxy", lambda: tcp(proxy))
-print(json.dumps(r))
-"""
-
-
-def selftest_scratch(ctx, sb, record, fresh, denied, env):
-    """The probes for the scratch dirs and loopback (design R6)."""
-    entries = ctx.get("temp_entries") or {}
-    tmp = "/private/tmp"
-    p = fresh(tmp, "offload-probe")
-    q = sb(["/bin/sh", "-c", f'echo ok > "{p}" && cat "{p}"'])
-    leftover = os.path.lexists(p)
-    if leftover:
-        os.remove(p)
-    record("write+read a new file in /private/tmp succeeds", q.returncode == 0 and q.stdout.strip() == "ok",
-           q.stderr.strip())
-    old = next((n for n in entries.get(tmp, []) if not n.startswith("claude") and os.path.lexists(f"{tmp}/{n}")), None)
-    if old:
-        q = sb(["/bin/ls", "-d", f"{tmp}/{old}"])
-        record("existing /private/tmp entry is denied", denied(q) and not q.stdout, q.stderr.strip())
-    else:
-        record("existing /private/tmp entry is denied (none exists, skipped)", True)
-    git = f"{tmp}/.git"
-    pre = os.path.lexists(git)
-    q = sb(["/bin/mkdir", "-p", f"{git}/x"])
-    if not pre and os.path.lexists(git):
-        shutil.rmtree(git, ignore_errors=True)
-    record("write /private/tmp/.git/x is denied", denied(q) and not (os.path.lexists(git) and not pre), q.stderr.strip())
-    if user_temp_dir():
-        xc = user_temp_dir() + "xcrun_db"
-        q = sb(["/bin/cat", xc])
-        record("read of <T>xcrun_db is denied", denied(q), q.stderr.strip())
-        q = sb(["/usr/bin/touch", xc])
-        record("write of <T>xcrun_db is denied", denied(q), q.stderr.strip())
-    py = shutil.which("python3", path=env["PATH"])
-    if not (py and ctx.get("proxy_port")):
-        record("loopback probes (no python3 or no proxy, skipped)", True)
-        return
-    hosts = [p for p in ctx.get("host_ports") or [] if p != ctx["proxy_port"] and p > 1023][:3]
-    q = sb([py, "-c", _NET_PROBE, str(ctx["proxy_port"]), *map(str, hosts)], timeout=30)
-    try:
-        r = json.loads(q.stdout)
-    except ValueError:
-        record("loopback probes ran", False, (q.stderr or q.stdout).strip())
-        return
-    record("bind+listen+connect on a fresh localhost port works", r["listen_connect"] == ALLOW_LISTEN)
-    record("UDP send to localhost is denied", r["udp"] is False)
-    record("the proxy port is reachable", r["proxy"] is True)
-    record("binding the proxy port is denied", r["take%d" % ctx["proxy_port"]] is False)
-    if hosts:
-        record("binding a snapshotted host port is denied", all(r["take%d" % h] is False for h in hosts),
-               f"ports {hosts}")
-    else:
-        record("binding a snapshotted host port is denied (none above 1023, skipped)", True)
-
-
-def run_selftest(ctx, online=None):
-    """Deterministic sandbox checks, no model. Returns (ok, results).
-
-    When ctx['proxy_port'] is set the proxy must be up; the worker profile then allows that one port.
-    `online` says whether to run the probe that fetches a real registry page; None means run it only when
-    pypi.org resolves from here (it is skipped when offline)."""
-    env = build_worker_env(ctx["run_dir"], ctx["model"], worker_url(ctx), ctx["max_thinking"],
-                           allow_read=ctx.get("allow_read", ()), registries=ctx.get("registries", ()),
-                           context_tokens=ctx.get("context_tokens"))
-    hm = real_home()
-    results = []
-    curl = "/usr/bin/curl"
-
-    def sb(argv, timeout=15, binary=False):
-        try:
-            return subprocess.run(sandbox_argv(ctx["profile"], argv), cwd=ctx["src"], env=env, shell=False,
-                                  capture_output=True, text=not binary, timeout=timeout,
-                                  errors=None if binary else "replace")
-        except subprocess.TimeoutExpired:
-            return subprocess.CompletedProcess(argv, 124, b"" if binary else "", b"timeout" if binary else "timeout")
-
-    def record(name, ok, detail=""):
-        results.append({"check": name, "ok": bool(ok), "detail": detail[:200]})
-
-    def fresh(base_dir, prefix):
-        while True:
-            p = os.path.join(base_dir, f"{prefix}-{secrets.token_hex(6)}")
-            if not os.path.lexists(p):
-                return p
-
-    denied = lambda p: p.returncode != 0 and "not permitted" in p.stderr.lower()
-    probe = next((os.path.join(hm, f) for f in (".ssh/known_hosts", ".zshrc", ".gitconfig")
-                  if os.path.exists(os.path.join(hm, f))), None)
-    if probe:
-        p = sb(["/bin/cat", probe])
-        record("read of a home file is denied", denied(p) and not p.stdout, p.stderr.strip())
-    else:
-        record("read of a home file is denied (no probe file exists, skipped)", True)
-    p = sb(["/bin/ls", hm])
-    record("ls $HOME is denied", denied(p) and not p.stdout, p.stderr.strip())
-    wprobe = fresh(ctx["repo"], ".offload-probe")  # did not exist, so only what we created is removed
-    p = sb(["/usr/bin/touch", wprobe])
-    created = os.path.lexists(wprobe)
-    if created:
-        os.remove(wprobe)
-    record("write into the source repo is denied", denied(p) and not created, p.stderr.strip())
-    if os.path.exists(curl):
-        p = sb([curl, "-m", "3", "-sS", "https://example.com"], timeout=15)
-        record("network to example.com fails", p.returncode != 0 and not p.stdout, p.stderr.strip())
-        if os.path.exists("/var/run/docker.sock"):
-            p = sb([curl, "-s", "-v", "-m", "2", "--unix-socket", "/var/run/docker.sock", "http://d/_ping"])
-            record("unix socket connect (docker.sock) fails", p.returncode == 7 or "Connected" not in p.stderr,
-                   f"exit {p.returncode}")
-        if ctx.get("proxy_port"):
-            p = sb([curl, "-s", "-m", "3", "-o", "/dev/null", "-w", "%{http_code}", "-X", "POST",
-                    f"http://127.0.0.1:{ctx['proxy_port']}/api/pull", "-d", "{}"])
-            record("proxy answers 403 for POST /api/pull", p.stdout.strip() == "403",
-                   f"http {p.stdout.strip()!r} exit {p.returncode}")
-            port = ctx["proxy_port"]
-            base = f"http://127.0.0.1:{port}"
-
-            def code_of(name, args):
-                q = sb([curl, "-s", "-m", "5", "-o", "/dev/null", "-w", "%{http_code}", *args])
-                record(name, q.stdout.strip() == "403", f"http {q.stdout.strip()!r} exit {q.returncode}")
-
-            q = sb([curl, "-s", "-m", "5", "-p", "-x", base, "-o", "/dev/null", "-w", "%{http_connect}",
-                    "https://pypi.org/"])
-            record("proxy answers 403 for CONNECT pypi.org:443", q.stdout.strip() == "403",
-                   f"http {q.stdout.strip()!r} exit {q.returncode}")
-            code_of("proxy answers 403 for an absolute-form GET", ["-x", base, "http://example.com/"])
-            code_of("proxy answers 403 for PUT /r/npm/x", ["-X", "PUT", f"{base}/r/npm/x"])
-            code_of("proxy answers 403 for GET /r/pypi/../../x", ["--path-as-is", f"{base}/r/pypi/../../x"])
-            code_of("proxy answers 403 for GET /r/nope/", [f"{base}/r/nope/"])
-            if "pypi" not in ctx.get("registries", ()):
-                code_of("proxy answers 403 for GET /r/pypi/simple/pip/ (pypi not enabled)", [f"{base}/r/pypi/simple/pip/"])
-            else:
-                if online is None:
-                    try:
-                        socket.getaddrinfo("pypi.org", 443)
-                        online = True
-                    except OSError:
-                        online = False
-                if online:
-                    q = sb([curl, "-s", "-m", "20", "-w", "\n%{http_code}", f"{base}/r/pypi/simple/pip/"], timeout=30)
-                    body, _, code = q.stdout.rpartition("\n")
-                    record("proxy serves /r/pypi/simple/pip/ with rewritten links",
-                           code.strip() == "200" and "files.pythonhosted.org" not in body and "/r/pyfiles/" in body,
-                           f"http {code.strip()!r} exit {q.returncode}")
-                else:
-                    record("proxy serves /r/pypi/simple/pip/ (offline, skipped)", True)
-            record("the 33rd concurrent proxy connection is closed", *_probe_conn_limit(port))
-    if os.path.exists("/usr/bin/pbpaste"):
-        p = sb(["/usr/bin/pbpaste"], binary=True)  # never printed or stored: only the byte count
-        record("pbpaste yields nothing", p.returncode != 0 or len(p.stdout) == 0, f"exit {p.returncode}, {len(p.stdout)} bytes")
-    if os.path.exists("/usr/bin/dscacheutil"):
-        p = sb(["/usr/bin/dscacheutil", "-q", "host", "-a", "name", "example.com"])
-        record("DNS lookup of example.com fails", "ip_address" not in p.stdout and "ipv6_address" not in p.stdout,
-               f"exit {p.returncode}")
-    selftest_scratch(ctx, sb, record, fresh, denied, env)
-    sprobe = fresh(ctx["src"], ".probe")
-    p = sb(["/usr/bin/touch", sprobe])
-    ok = p.returncode == 0 and os.path.exists(sprobe)
-    if os.path.lexists(sprobe):
-        os.remove(sprobe)
-    record("write into src succeeds", ok, p.stderr.strip())
-    return all(r["ok"] for r in results), results
-
-
 def commit_work(ctx):
-    """Step 7: commit src/ onto branch `work` in the helper-owned repo. Returns head sha."""
+    """Commit src/ onto branch `work` in the helper-owned repo. Returns head sha."""
     gh = ctx["ghome"]
     embedded = os.path.join(ctx["src"], ".git")
     if os.path.lexists(embedded):  # a worker-made repo at the root would be added as a gitlink
@@ -1709,7 +603,7 @@ def commit_work(ctx):
 
 
 def fetch_work(ctx):
-    """Step 8/9: fetch `work` into the source repo as offload/<slug> without ever overwriting.
+    """Fetch `work` into the source repo as offload/<slug> without ever overwriting.
 
     Fetch (no +) into a temporary ref, create the branch with an expected-absent old value, delete the
     temporary ref even on failure. The ref snapshot brackets only this window; any change other than the
@@ -1730,7 +624,7 @@ def fetch_work(ctx):
 
 
 def verify_refs(ctx):
-    """Step 9: the unexpected ref changes seen around the fetch (empty means fine)."""
+    """The unexpected ref changes seen around the fetch (empty means fine)."""
     return ctx.get("ref_violations", [])
 
 
@@ -1829,28 +723,16 @@ def pump(proc, timeout_s, on_data):
         sel.close()
 
 
-WORKER_PREAMBLE = ("You are working in a copy of the repo, in the current directory. git works locally: there is "
-                   "no remote. There is no network except the model. Make temp files with "
-                   "`mktemp -d \"$TMPDIR/x.XXXXXX\"`. Write the code and tests the brief asks for, run the tests, "
-                   "commit if you like, and finish with a short summary.\n\n")
+CLAUDE_PREAMBLE = ("You are working in a copy of the repo, in the current directory. git works locally: there is "
+                   "no remote. Make temp files with `mktemp -d \"$TMPDIR/x.XXXXXX\"`. Write the code and tests the "
+                   "brief asks for, run the tests, commit if you like, and finish with a short summary.\n\n")
+CODEX_PREAMBLE = ("You are working in a copy of the repo at the current directory. git works locally; there is no "
+                  "remote. Write the code and tests the brief asks for, run the tests, and finish with a short "
+                  "summary of what you changed.\n\n")
 
 
-def launch_worker(ctx, brief_text, timeout_s):
-    """Step 5/6: run the worker, reading stream-json incrementally. Returns an outcome dict."""
-    env = build_worker_env(ctx["run_dir"], ctx["model"], worker_url(ctx), ctx["max_thinking"],
-                           allow_read=ctx.get("allow_read", ()), registries=ctx.get("registries", ()),
-                           context_tokens=ctx.get("context_tokens"))
-    argv = sandbox_argv(ctx["profile"], build_claude_argv(ctx["claude"]["real"], ctx["max_turns"], temp_roots()))
-    preamble = WORKER_PREAMBLE
-    log_path = os.path.join(ctx["run_dir"], "worker.jsonl")
-    out = {"init_problems": [], "saw_init": False, "timed_out": False, "result": None, "usage": {},
-           "text": "", "log_path": log_path, "survivors_killed": []}
-    per_msg = {}
-    buf = [b""]
-    progress = Progress(ctx["run_dir"], ctx["record"])
-
+def _claude_handler(out, per_msg, progress):
     def handle_line(raw):
-        """Returns True to stop reading (init check failed)."""
         try:
             ev = json.loads(raw)
         except ValueError:
@@ -1877,6 +759,64 @@ def launch_worker(ctx, brief_text, timeout_s):
         elif ev.get("type") == "result":
             out["result"] = ev
         return False
+    return handle_line
+
+
+def _codex_usage(u):
+    """codex turn.completed usage -> the shape sum_usage/Progress expect."""
+    return {"input_tokens": u.get("input_tokens"), "cache_read_input_tokens": u.get("cached_input_tokens"),
+            "cache_creation_input_tokens": u.get("cache_write_input_tokens"), "output_tokens": u.get("output_tokens")}
+
+
+def _codex_handler(out, per_msg, progress):
+    def handle_line(raw):
+        try:
+            ev = json.loads(raw)
+        except ValueError:
+            return False
+        if not isinstance(ev, dict):
+            return False
+        t = ev.get("type")
+        if t == "thread.started":
+            out["saw_init"] = True
+        elif t == "item.completed":
+            item = ev.get("item") or {}
+            if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
+                out["text"] = item["text"]
+            elif item.get("type") in ("command_execution", "file_change", "mcp_tool_call", "patch_apply"):
+                progress.tool_use(1)
+        elif t == "turn.completed":
+            u = ev.get("usage")
+            if isinstance(u, dict):
+                mapped = _codex_usage(u)
+                per_msg[len(per_msg)] = mapped
+                progress.usage(per_msg.values(), mapped)
+                out["result"] = ev
+                out["turns"] = out.get("turns", 0) + 1
+        elif t == "error":
+            out["error_event"] = sanitize_untrusted(str(ev.get("message") or ev), 500)
+        return False
+    return handle_line
+
+
+def launch_worker(ctx, brief_text, timeout_s):
+    """Run the worker, reading its event stream incrementally. Returns an outcome dict."""
+    env = build_worker_env(ctx)
+    log_path = os.path.join(ctx["run_dir"], "worker.jsonl")
+    last_msg = os.path.join(ctx["run_dir"], "last_message.txt")
+    out = {"init_problems": [], "saw_init": False, "timed_out": False, "result": None, "usage": {},
+           "text": "", "log_path": log_path, "survivors_killed": [], "turns": 0}
+    per_msg = {}
+    buf = [b""]
+    progress = Progress(ctx["run_dir"], ctx["record"])
+    if ctx["kind"] == "codex":
+        argv = build_codex_argv(ctx["worker_bin"]["real"], ctx["src"], ctx["model"], last_msg)
+        preamble = CODEX_PREAMBLE
+        handle_line = _codex_handler(out, per_msg, progress)
+    else:
+        argv = build_claude_argv(ctx["worker_bin"]["real"], ctx["max_turns"])
+        preamble = CLAUDE_PREAMBLE
+        handle_line = _claude_handler(out, per_msg, progress)
 
     with open(log_path, "wb") as log, open(os.path.join(ctx["run_dir"], "worker.stderr"), "wb") as errf:
         ctx["record"].update(status="running", started_at=time.time(), tool_calls=0)
@@ -1898,7 +838,7 @@ def launch_worker(ctx, brief_text, timeout_s):
             log.flush()
             buf[0] += chunk
             *lines, buf[0] = buf[0].split(b"\n")
-            if len(buf[0]) > 16 * 1024 * 1024:  # a line this long is not stream-json
+            if len(buf[0]) > 16 * 1024 * 1024:
                 buf[0] = b""
             for raw in lines:
                 if handle_line(raw):
@@ -1910,14 +850,6 @@ def launch_worker(ctx, brief_text, timeout_s):
             if buf[0] and not out["init_problems"]:
                 handle_line(buf[0])
         finally:
-            # Listeners the worker left (or its survivors still hold), before the sweep kills them.
-            try:
-                start = ctx.get("listeners_at_start")
-                if start is None:
-                    raise OffloadError("no start snapshot")
-                ctx["record"]["worker_listeners"] = sorted(snapshot_listen_ports() - start - {ctx.get("proxy_port")})
-            except OffloadError:
-                ctx["record"]["worker_listeners"] = None
             out["survivors_killed"] = sweep_survivors(proc, ctx["run_dir"])
             try:
                 proc.stdout.close()
@@ -1928,12 +860,23 @@ def launch_worker(ctx, brief_text, timeout_s):
             except subprocess.TimeoutExpired:
                 kill_group(proc)
                 out["returncode"] = proc.wait()
+    # Prefer the final-message file (codex) for the summary text.
+    try:
+        with open(last_msg, encoding="utf-8", errors="replace") as f:
+            txt = f.read().strip()
+            if txt:
+                out["text"] = txt
+    except OSError:
+        pass
     res = out["result"] or {}
-    u = res.get("usage") if isinstance(res.get("usage"), dict) else None
-    out["usage"] = sum_usage([u] if u is not None else per_msg.values())
-    out["turns"] = int(res.get("num_turns", 0) or 0)
-    if isinstance(res.get("result"), str) and res["result"]:
-        out["text"] = res["result"]
+    if ctx["kind"] == "codex":
+        out["usage"] = sum_usage(list(per_msg.values()))
+    else:
+        u = res.get("usage") if isinstance(res.get("usage"), dict) else None
+        out["usage"] = sum_usage([u] if u is not None else list(per_msg.values()))
+        out["turns"] = int(res.get("num_turns", 0) or 0)
+        if isinstance(res.get("result"), str) and res["result"]:
+            out["text"] = res["result"]
     return out
 
 
@@ -1963,11 +906,10 @@ def load_run(ohome, run_id):
 
 def ctx_from_record(rec):
     rd = rec["run_dir"]
-    return {"run_id": rec["run_id"], "run_dir": rd, "repo": rec["repo"], "slug": rec["slug"], "model": rec["model"],
-            "claude": rec.get("claude"), "allow_read": rec.get("allow_read") or [], "registries": rec.get("registries") or [], "proxy_port": None,
+    return {"run_id": rec["run_id"], "run_dir": rd, "repo": rec["repo"], "slug": rec["slug"],
+            "kind": rec.get("kind", "claude"), "model": rec.get("model"), "worker_bin": rec.get("worker"),
             "git_dir": os.path.join(rd, "git"), "src": os.path.join(rd, "src"),
-            "profile": os.path.join(rd, "profile.sb"), "ghome": os.path.join(rd, "home"),
-            "max_thinking": DEFAULT_MAX_THINKING}
+            "ghome": os.path.join(rd, "home"), "max_thinking": DEFAULT_MAX_THINKING}
 
 
 def diff_summary(ctx):
@@ -2002,31 +944,36 @@ def count_format_chars(*texts):
 
 def cmd_run(args, ohome):
     t0 = time.monotonic()
-    if sys.platform != "darwin" or not os.path.exists(SANDBOX_EXEC):
-        raise OffloadError("offload needs macOS with /usr/bin/sandbox-exec")
     with open(args.brief, encoding="utf-8") as f:
         brief = f.read()
     slug = validate_slug(args.slug or default_slug(args.brief))
-    registries = parse_registries(args.registries)
-    claude = resolve_claude()
-    if args.worker:
-        if args.base_url or args.model:
-            raise OffloadError("--worker sets the base URL and model; don't pass --base-url or --model with it")
-        w = resolve_worker(args.worker)
-        if not worker_up(w["base_url"], w["model"]):
-            raise OffloadError(f"worker {args.worker!r} is down: {w['base_url']} does not answer for {w['model']}; "
-                               "pick another worker (offload.py workers) or the cloud model")
-        args.base_url, args.model = w["base_url"], w["model"]
-        context_tokens = w.get("context_tokens")
+    kind = args.kind or "claude"
+    if kind not in KINDS:
+        raise OffloadError(f"invalid --kind {kind!r}; choose from {', '.join(KINDS)}")
+    base = None
+    context_tokens = None
+    if kind == "codex":
+        if args.worker or args.base_url:
+            raise OffloadError("--kind codex uses your codex subscription; don't pass --worker or --base-url")
+        worker_bin = resolve_codex()
+        model = args.model
     else:
-        context_tokens = None
-    args.model = args.model or DEFAULT_MODEL
-    base = resolve_base_url(args.base_url)
-    ctx = prepare_run(args.repo, slug, ohome, args.model, base, claude, args.allow_read,
-                      args.max_thinking_tokens, args.max_turns, registries)
-    ctx["context_tokens"] = context_tokens
+        worker_bin = resolve_claude()
+        if args.worker:
+            if args.base_url or args.model:
+                raise OffloadError("--worker sets the base URL and model; don't pass --base-url or --model with it")
+            w = resolve_worker(args.worker)
+            if not worker_up(w["base_url"], w["model"]):
+                raise OffloadError(f"worker {args.worker!r} is down: {w['base_url']} does not answer for "
+                                   f"{w['model']}; pick another worker (offload.py workers) or the cloud model")
+            args.base_url, args.model = w["base_url"], w["model"]
+            context_tokens = w.get("context_tokens")
+        model = args.model or DEFAULT_MODEL
+        base = resolve_base_url(args.base_url)
+
+    ctx = prepare_run(args.repo, slug, ohome, kind, worker_bin, model, base, args.max_thinking_tokens,
+                      args.max_turns, context_tokens)
     rec = ctx["record"]
-    rec["context_window"] = context_tokens  # the worker's window when known (named workers), else null
 
     def finish(status, extra=None):
         rec["status"] = status
@@ -2036,40 +983,17 @@ def cmd_run(args, ohome):
         write_run_json(ctx["run_dir"], rec)
 
     out = {"status": None, "run_id": ctx["run_id"], "repo": ctx["repo"], "branch": f"offload/{slug}",
-           "base_sha": ctx["base_sha"], "head_sha": None, "model": args.model, "turns": 0, "duration_s": 0,
-           "usage": {"input": 0, "cache_read": 0, "output": 0}, "est_cost_usd": None, "untrusted_diffstat": "",
-           "untrusted_sensitive_paths": [], "untrusted_worker_text": "", "format_chars": 0,
-           "survivors_killed": [], "log_path": os.path.join(ctx["run_dir"], "worker.jsonl"),
-           "warnings": ctx["warnings"], "registries": registries}
+           "base_sha": ctx["base_sha"], "head_sha": None, "kind": kind, "model": model, "turns": 0,
+           "duration_s": 0, "usage": {"input": 0, "cache_read": 0, "output": 0}, "est_cost_usd": None,
+           "untrusted_diffstat": "", "untrusted_sensitive_paths": [], "untrusted_worker_text": "",
+           "format_chars": 0, "survivors_killed": [], "log_path": os.path.join(ctx["run_dir"], "worker.jsonl")}
     head = None
     try:
         init_worker_git(ctx)
-        proxy = EgressProxy(base["url"], os.path.join(ctx["run_dir"], "proxy_rejects.log"),
-                           registries=ctx["registries"])
-        try:
-            ctx["proxy_port"] = proxy.start()
-            # Host listeners now, proxy included. The worker may not bind these ports (a takeover would receive the
-            # host's loopback clients), so this is security-relevant: fail closed if netstat fails or finds none.
-            ctx["listeners_at_start"] = snapshot_listen_ports()
-            ctx["host_ports"] = sorted(ctx["listeners_at_start"])
-            rec["host_listeners"] = sorted(ctx["listeners_at_start"] - {ctx["proxy_port"]})
-            write_run_json(ctx["run_dir"], rec)
-            write_profile(ctx, ctx["proxy_port"])
-            write_registry_configs(ctx["run_dir"], worker_url(ctx), ctx["registries"])
-            ok, checks = run_selftest(ctx)
-            if not ok:
-                out.update(status="sandbox_selftest_failed", selftest=checks)
-                finish("sandbox_selftest_failed")
-                out["duration_s"] = rec["duration_s"]
-                emit(out)
-                return 1
-            w = launch_worker(ctx, brief, args.timeout_min * 60)
-        finally:
-            proxy.stop()  # as soon as the worker ends, times out, or fails the init check
-        out["registry_requests"] = rec["registry_requests"] = proxy.registry_summary()
-        out.update(turns=w["turns"], usage=w["usage"], est_cost_usd=estimate_cost(args.model, w["usage"]),
+        w = launch_worker(ctx, brief, args.timeout_min * 60)
+        out.update(turns=w["turns"], usage=w["usage"], est_cost_usd=estimate_cost(model, w["usage"]),
                    survivors_killed=w["survivors_killed"])
-        if w["init_problems"] or not w["saw_init"]:
+        if kind == "claude" and (w["init_problems"] or not w["saw_init"]):
             problems = w["init_problems"] or ["no system/init event seen before the worker ended"]
             out.update(status="init_check_failed", init_problems=problems)
             finish("init_check_failed", {"init_problems": problems, "usage": w["usage"],
@@ -2133,15 +1057,16 @@ def _rmtree_force(path, run_dir):
 
 
 def cmd_test(args, ohome):
+    """Run a command against the committed `work` tree in a throwaway checkout. The worker's code runs
+    directly (no jail): only use this once you have reviewed the diff, or on code you are willing to run."""
     rec = load_run(ohome, args.run)
     ctx = ctx_from_record(rec)
+    ctx["base_sha"] = rec["base_sha"]
     cmd = list(args.test_cmd)
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
     if not cmd:
         raise OffloadError("no command given: offload.py test --run ID -- CMD...")
-    if not ctx["claude"]:
-        raise OffloadError("run.json has no claude info; this run predates `test` exporting committed code")
     n = 1
     while True:
         testsrc = os.path.join(ctx["run_dir"], f"testsrc-{n}")
@@ -2150,25 +1075,17 @@ def cmd_test(args, ohome):
             break
         except FileExistsError:
             n += 1
-    tprofile = os.path.join(ctx["run_dir"], f"profile-test-{n}.sb")
-    tctx = dict(ctx, src=testsrc, profile=tprofile, proxy_port=None)
     killed = []
     try:
-        # Test what was committed, not whatever the worker left in src/. No proxy, no network at all.
+        # Test what was committed, not whatever the worker left in src/.
         proc = subprocess.Popen(safe_git_argv(["--git-dir", ctx["git_dir"], "archive", "work"], ctx["ghome"]),
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False)
         extract_tar_safely(proc.stdout, testsrc)
         err = proc.stderr.read()
         if proc.wait() != 0:
             raise OffloadError(f"git archive failed: {err.decode(errors='replace')[:300]}")
-        write_profile(tctx, None, src_dir=testsrc, path=tprofile)
-        ok, checks = run_selftest(tctx)
-        if not ok:
-            emit({"status": "sandbox_selftest_failed", "selftest": checks})
-            return 1
-        env = build_worker_env(ctx["run_dir"], ctx["model"], worker_url(tctx), allow_read=ctx["allow_read"],
-                               registries=ctx.get("registries", ()))
-        proc = subprocess.Popen(sandbox_argv(tprofile, cmd), cwd=testsrc, env=env, shell=False,
+        env = build_worker_env(dict(ctx, base={"url": DEFAULT_BASE_URL}))
+        proc = subprocess.Popen(cmd, cwd=testsrc, env=env, shell=False,
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 start_new_session=True)
         ring, total = bytearray(), [0]
@@ -2194,8 +1111,6 @@ def cmd_test(args, ohome):
                 code = proc.wait()
     finally:
         _rmtree_force(testsrc, ctx["run_dir"])
-        if os.path.lexists(tprofile):
-            os.remove(tprofile)
         if killed:
             rec["survivors_killed"] = sorted(set(rec.get("survivors_killed") or []) | set(killed))
             write_run_json(ctx["run_dir"], rec)
@@ -2235,7 +1150,8 @@ def cmd_list(args, ohome):
                 r = json.load(f)
         except (OSError, ValueError):
             continue
-        runs.append({k: r.get(k) for k in ("run_id", "status", "repo", "branch", "model", "head_sha", "created")})
+        runs.append({k: r.get(k) for k in ("run_id", "status", "repo", "branch", "kind", "model", "head_sha",
+                                            "created")})
     emit({"runs": runs})
     return 0
 
@@ -2281,14 +1197,13 @@ def build_parser():
     r.add_argument("--repo", required=True)
     r.add_argument("--brief", required=True)
     r.add_argument("--slug")
+    r.add_argument("--kind", choices=KINDS, default="claude")
     r.add_argument("--model")
-    r.add_argument("--worker", help="a named worker from config `workers` (sets base URL and model)")
+    r.add_argument("--worker", help="a named worker from config `workers` (claude kind; sets base URL and model)")
     r.add_argument("--max-turns", type=int, default=DEFAULT_MAX_TURNS)
     r.add_argument("--timeout-min", type=float, default=DEFAULT_TIMEOUT_MIN)
     r.add_argument("--max-thinking-tokens", type=int, default=DEFAULT_MAX_THINKING)
-    r.add_argument("--allow-read", action="append", default=[])
     r.add_argument("--base-url")
-    r.add_argument("--registries", default=",".join(REGISTRY_GROUPS), metavar="LIST")
     t = sub.add_parser("test")
     t.add_argument("--run", required=True)
     t.add_argument("--timeout-s", type=float, default=600)
