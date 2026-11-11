@@ -1,7 +1,7 @@
 {
   "name": "clear-writing",
-  "description": "Write and edit clear, concise, accurate documentation. Cut repetition and clever phrasing while preserving meaning and evidence.",
-  "version": "1.0.0",
+  "description": "Write, edit, and review clear, concise, accurate documentation, with guidance for RFCs, ADRs, READMEs, how-to guides, and reference docs.",
+  "version": "1.1.0",
   "author": {
     "name": "apato"
   },
