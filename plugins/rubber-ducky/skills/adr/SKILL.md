@@ -7,6 +7,7 @@ description: >-
   "supersede ADR". Pre-populates from tradeoff-analysis or decision-matrix artifacts when invoked
   after them.
 user-invocable: true
+disable-model-invocation: true
 ---
 
 # ADR — Architecture Decision Records
@@ -155,7 +156,7 @@ If superseding another ADR, also update the old ADR's status line to `Superseded
 | Decision needs implementation | "Want me to switch to plan mode to implement this decision?" |
 | Decision is one of several in a larger feature | "This looks like part of a bigger design. Want an RFC that collects the related decisions? (`/rubber-ducky:rfc`)" |
 | Decision needs team review | "This is marked as Proposed. Share it with the team — when it's accepted, run `/rubber-ducky:adr` to update the status." |
-| More decisions to document | "Want to write another ADR, or keep thinking through related decisions?" (invoke `/rubber-ducky:rubber-ducky`) |
+| More decisions to document | "Want to write another ADR, or keep thinking through related decisions?" (on yes, tell the user to run `/rubber-ducky:rubber-ducky`) |
 
 ## Iterating on Existing ADRs
 

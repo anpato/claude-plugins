@@ -6,6 +6,7 @@ description: >-
   this down", "too many moving parts", "how do I sequence this". Also invoked when rubber-ducky
   routes here.
 user-invocable: true
+disable-model-invocation: true
 ---
 
 # Problem Decomposition
@@ -72,8 +73,8 @@ If multiple sub-problems tie, ask the user:
 
 For the chosen sub-problem:
 - **It's clear enough to plan** → "Want me to switch to plan mode for [sub-problem]?"
-- **It needs more thinking** → "Let's rubber-duck [sub-problem] to make sure we understand it." (invoke `/rubber-ducky:rubber-ducky`)
-- **Multiple approaches to solve it** → "There are a few ways to approach [sub-problem] — want to compare them?" (invoke `/rubber-ducky:tradeoff-analysis`)
+- **It needs more thinking** → "Let's rubber-duck [sub-problem] to make sure we understand it." (on yes, tell the user to run `/rubber-ducky:rubber-ducky`)
+- **Multiple approaches to solve it** → "There are a few ways to approach [sub-problem] — want to compare them?" (on yes, tell the user to run `/rubber-ducky:tradeoff-analysis`)
 
 ### Step 6: Track Progress
 

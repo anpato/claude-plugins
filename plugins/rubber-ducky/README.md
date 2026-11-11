@@ -16,9 +16,9 @@ A Socratic problem-solving companion for Claude Code. Think through problems con
 
 ## How It Works
 
-1. Start with `/rubber-ducky` (or it auto-triggers on "help me think through...", "I'm stuck on...", etc.)
+1. Start with `/rubber-ducky:rubber-ducky`. The skills are slash-command only (`disable-model-invocation: true`), so they never auto-trigger and cost no context until you run one
 2. The duck listens, reflects, and asks probing questions — one at a time
-3. As the problem becomes clearer, it may route to a sub-skill (five-whys, tradeoff-analysis, etc.)
+3. As the problem becomes clearer, it suggests a sub-skill (five-whys, tradeoff-analysis, etc.) for you to run
 4. When a solution crystallizes, it offers to hand off to plan mode for implementation
 
 ## Philosophy

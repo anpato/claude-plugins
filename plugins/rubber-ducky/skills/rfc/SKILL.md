@@ -8,6 +8,7 @@ description: >-
   Writes the document only, never the feature code. Hands accepted decisions off to
   rubber-ducky:adr.
 user-invocable: true
+disable-model-invocation: true
 ---
 
 # RFC — Request for Comments

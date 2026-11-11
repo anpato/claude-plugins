@@ -6,6 +6,7 @@ description: >-
   cons", "which approach is better", "help me choose between". Presents the comparison; you make
   the call. Also invoked when rubber-ducky routes here.
 user-invocable: true
+disable-model-invocation: true
 ---
 
 # Tradeoff Analysis
@@ -83,9 +84,9 @@ If the user asks for your opinion: give a lean with reasoning, not a verdict.
 
 Once the user picks a direction:
 - **Solution is clear** → "Want me to switch to plan mode and lay out the implementation for [chosen approach]?"
-- **Decision should be documented** → "Want to record this as an Architecture Decision Record? It'll capture the options you considered and why you chose [chosen approach]." (invoke `/rubber-ducky:adr`)
-- **Chosen approach needs more exploration** → "Want to rubber-duck the details of [chosen approach]?" (invoke `/rubber-ducky:rubber-ducky`)
-- **Chosen approach is complex** → "This might benefit from decomposition — want to break it into pieces?" (invoke `/rubber-ducky:problem-decomposition`)
+- **Decision should be documented** → "Want to record this as an Architecture Decision Record? It'll capture the options you considered and why you chose [chosen approach]." (on yes, tell the user to run `/rubber-ducky:adr`)
+- **Chosen approach needs more exploration** → "Want to rubber-duck the details of [chosen approach]?" (on yes, tell the user to run `/rubber-ducky:rubber-ducky`)
+- **Chosen approach is complex** → "This might benefit from decomposition — want to break it into pieces?" (on yes, tell the user to run `/rubber-ducky:problem-decomposition`)
 
 ## Persistence
 
