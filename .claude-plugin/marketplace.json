@@ -12,7 +12,7 @@
     {
       "name": "clear-writing",
       "source": "./plugins/clear-writing",
-      "description": "Write and edit clear, concise, accurate documentation. Cut repetition and clever phrasing while preserving meaning and evidence.",
+      "description": "Write, edit, and review clear, concise, accurate documentation, with guidance for RFCs, ADRs, READMEs, how-to guides, and reference docs.",
       "category": "productivity",
       "keywords": ["writing", "editing", "documentation", "plain-language", "rfc"]
     },

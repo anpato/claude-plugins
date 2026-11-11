@@ -8,7 +8,7 @@ lives under [`plugins/`](./plugins) and is registered in
 
 | Plugin | What it does |
 |--------|--------------|
-| [`clear-writing`](./plugins/clear-writing) | Write and edit clear, concise, accurate docs; remove repetition and clever phrasing without losing meaning. |
+| [`clear-writing`](./plugins/clear-writing) | Write, edit, and review clear, concise, accurate docs, with guidance for each document type. |
 | [`rubber-ducky`](./plugins/rubber-ducky) | Socratic problem-solving companion — think a problem through before writing code, with sub-skills for root-cause, tradeoffs, decomposition, decision matrices, and ADRs. |
 | [`adversary`](./plugins/adversary) | Adversarial reviewer and red-teamer — attack a PR/diff (`adversarial-review`) or pre-mortem a design before building it (`red-team-build`). |
 | [`squad`](./plugins/squad) | Live panel of your subagents as tiny animated vehicles — what each is doing, model, steps, context and time (`/squad`). |
