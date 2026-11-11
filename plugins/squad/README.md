@@ -47,6 +47,25 @@ Runs under `~/.cache/offload/runs/*/run.json` (checked every 5 s, only if the di
 that this session started (their `session_id` matches) appear as `offload` rows: `prepared` or `running` runs while live, and `ok`, `failed` or `timeout`
 runs for an hour after they end. A missing or malformed `run.json` is skipped.
 
+## Codex
+
+Codex can't host a pane, so the same panel runs as its own program in a terminal split beside
+Codex. It needs [Bun](https://bun.sh) and reads only what Codex already writes: which subagents a
+session spawned, with their names, model and effort (`~/.codex/state_N.sqlite`), and each one's
+tool calls, tokens and finish (its `rollout-*.jsonl`, appended live).
+
+```bash
+ln -s ~/projects/claude-plugins/plugins/squad/codex/squad-codex ~/.local/bin/squad-codex
+squad-codex            # follows the newest Codex session started in this directory
+squad-codex --session <thread id>
+squad-codex --blocks   # block vehicles even in Ghostty/kitty
+```
+
+Rows show the task name Codex gave the agent and its Codex nickname. Vehicles come from the tools
+inside Codex's `exec` script: `apply_patch` edits, reading commands (`cat`, `rg`, `sed`…) search,
+other commands run, MCP and web tools fly. Codex has no step tool, no transcript to open, and
+no band above its prompt, so those parts are Claude Code only. `q` quits.
+
 ## Install
 
 ```bash
@@ -58,4 +77,6 @@ Mods are an early-access Claude Code feature, and their API can change between r
 
 ## Develop
 
-`claude plugin validate plugins/squad` and `claude plugin test plugins/squad`.
+`claude plugin validate plugins/squad` and `claude plugin test plugins/squad`. The Codex viewer's
+tests are `bun test plugins/squad/codex` (named `.spec.ts`: `claude plugin test` loads every
+`*.test.ts` as a mod test and rejects `bun:test`).

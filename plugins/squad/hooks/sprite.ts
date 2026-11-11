@@ -179,6 +179,7 @@ const MODEL_COLORS: readonly (readonly [RegExp, number])[] = [
   [/sonnet/i, 0x6c9cf0],
   [/haiku/i, 0x63c58a],
   [/fable|mythos/i, 0xb48ead],
+  [/gpt|codex/i, 0x56b6c2],
 ]
 
 export const modelColor = (model: string): number =>
