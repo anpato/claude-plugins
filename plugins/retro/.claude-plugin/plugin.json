@@ -1,0 +1,10 @@
+{
+  "name": "retro",
+  "description": "Review completed work, agent and user decisions, tooling friction, and source-of-truth gaps, then turn evidence into concrete improvements.",
+  "version": "1.0.0",
+  "author": {
+    "name": "apato"
+  },
+  "license": "MIT",
+  "keywords": ["retrospective", "recap", "collaboration", "process-improvement", "lessons-learned"]
+}
