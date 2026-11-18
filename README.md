@@ -8,6 +8,7 @@ lives under [`plugins/`](./plugins) and is registered in
 
 | Plugin | What it does |
 |--------|--------------|
+| [`retro`](./plugins/retro) | Review outcomes, agent and user mistakes, tooling friction, and source-of-truth gaps, with evidence and concrete fixes (`/retro:retro`). |
 | [`clear-writing`](./plugins/clear-writing) | Write, edit, and review clear, concise, accurate docs, with guidance for each document type. |
 | [`rubber-ducky`](./plugins/rubber-ducky) | Socratic problem-solving companion — think a problem through before writing code, with sub-skills for root-cause, tradeoffs, decomposition, decision matrices, and ADRs. |
 | [`adversary`](./plugins/adversary) | Adversarial reviewer and red-teamer — attack a PR/diff (`adversarial-review`) or pre-mortem a design before building it (`red-team-build`). |
