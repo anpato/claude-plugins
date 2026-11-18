@@ -40,14 +40,36 @@ plan specifies a concrete change, a proposed owner, a target, a verification met
 its status. Sources of truth can be designs, tickets, docs, tests, or other agreed artifacts;
 the skill has no dependency on a particular tool.
 
-The default scope is the current conversation. When history or artifacts are missing,
-the report states its limits. It does not infer mistakes from missing context, force equal
+The default scope is the current session's stored transcript, including original turns
+before compaction. A bundled Python 3 reader resolves the exact session ID, freezes a
+review cutoff, and pages through messages and tool evidence without dropping middle turns
+or clipping large records. It labels compaction summaries and reports malformed records,
+unresolved parent links, replayed UUIDs, and subagent transcripts not yet reviewed. The
+skill checks summaries against original evidence and keeps a temporary continuation note
+when the review itself may compact. It needs no other plugin.
+
+You can also select a source explicitly:
+
+```text
+/retro:retro --session <exact-session-id>
+/retro:retro --transcript /absolute/path/session.jsonl
+```
+
+Transcripts are read from `$CLAUDE_CONFIG_DIR/projects` or `~/.claude/projects`, or from the
+supplied path. The helper is read-only. It excludes reasoning and binary payloads, and
+reports bookkeeping/request record categories it omits. Relevant child transcripts are
+reviewed separately. A completed pass covers available text; deleted originals cannot be
+recovered from a summary. Another runtime needs its native transcript reader or an export.
+
+When history or artifacts are missing, the report states its limits. It does not infer
+mistakes from missing context, force equal
 blame, or treat normal iteration as failure. It proposes changes without editing project
 rules, persistent memory, or shared artifacts unless fixes were also requested.
 
 ## Validation
 
 ```bash
+python3 -I -m unittest discover -s plugins/retro/tests
 command claude plugin validate plugins/retro
 command claude plugin validate .
 ```

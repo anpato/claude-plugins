@@ -6,6 +6,7 @@ description: >-
   Use for a retrospective, post-task recap, lessons learned, or a review of what went
   wrong in the collaboration and how to improve it. Not a substitute for reviewing
   code correctness or planning work that has not started.
+allowed-tools: Bash(python3 ${CLAUDE_PLUGIN_ROOT}/scripts/transcript.py *)
 ---
 
 # Retro
@@ -18,11 +19,21 @@ motives, grading people, or manufacturing equal responsibility.
 ## Establish the evidence
 
 Default to the work in the current conversation; honor any narrower task, time range,
-or supplied session history. State the intended outcome, what was delivered, and what
+or supplied session history. **Load and review the stored session transcript before making
+findings; the visible context or a compaction summary alone is insufficient.** Follow
+[transcript review](references/transcript-review.md) to identify the exact session, freeze
+the review cutoff, read every evidence page, and track coverage across compaction. The
+bundled reader requires Python 3 and no other plugin. For another runtime, use its native
+transcript reader or a supplied export with the same coverage and evidence requirements.
+
+Current Claude Code session ID: `${CLAUDE_SESSION_ID}`.
+User arguments: `$ARGUMENTS`.
+
+State the intended outcome, what was delivered, and what
 remains incomplete. Include successful choices worth keeping when supported by evidence.
 An unfinished or abandoned attempt can still have a useful retrospective.
 
-Use the conversation, applicable instructions, decisions, relevant artifacts, diffs,
+Use the transcript, applicable instructions, decisions, relevant artifacts, diffs,
 tool results, and verification records already available. Inspect connected sources or
 local files when they can resolve a material uncertainty within the requested scope.
 Keep retrieval focused on this work rather than searching unrelated session history.
@@ -32,7 +43,11 @@ location, artifact revision, or tool result. Distinguish observations from inter
 and unknowns. A current file or successful test does not establish what the agent knew
 or checked earlier. Do not invent timing, costs, failed attempts, or hidden reasoning.
 
-If the work predates the visible context, explain what can and cannot be assessed.
+If the transcript cannot be recovered or covers only part of the work, explain what can
+and cannot be assessed. A summary is a navigation aid and secondary evidence, not proof
+of the original instructions or actions. Check whether consequential requirements,
+decisions, or pending work were lost or distorted across compaction; distinguish an
+observed omission from an unverified claim about what caused later drift.
 Proceed with a bounded review when possible; request missing context only when it would
 materially change the findings. Absence from an incomplete transcript is not proof that
 an action was skipped. Unavailable evidence is a coverage limit, not automatically a
@@ -129,6 +144,10 @@ prioritized findings with evidence and responsibility, and an action plan linked
 findings. A compact table can connect changes, proposed owners, targets, verification,
 and status. Make agent and user contributions explicit where supported; say when no
 material issue was found for either rather than filling a blame quota.
+
+Include coverage: session or transcript identity, the frozen cutoff, reviewed ranges,
+compaction boundaries, and any missing originals, unread pages, or subagent history not
+reviewed. Distinguish a full review of the available text from complete historical access.
 
 Close with the material unknowns or decisions that remain. Keep evidence limits visible.
 For a small task, a few paragraphs and actions are enough. Deliver in the conversation
