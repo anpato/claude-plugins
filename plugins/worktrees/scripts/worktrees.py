@@ -108,6 +108,13 @@ def parse_status(data):
     return result
 
 
+def linked_worktrees(cwd):
+    data, _ = git(cwd, "worktree", "list", "--porcelain", "-z")
+    # Git guarantees the primary checkout (or bare repo) is first, regardless
+    # of its branch name or which worktree issued the command.
+    return parse_worktrees(data)[1:]
+
+
 def status(path):
     data, _ = git(path, "status", "--porcelain=v2", "--branch", "-z",
                   "--untracked-files=all", "--ignore-submodules=all")
@@ -217,9 +224,8 @@ def summarize(record, current, repo=None):
 
 
 def inventory(cwd):
-    data, _ = git(cwd, "worktree", "list", "--porcelain", "-z")
-    records = parse_worktrees(data)
-    # Bare repos have no toplevel; a session opened there still has a current row.
+    records = linked_worktrees(cwd)
+    # A bare repo has no toplevel but can still host linked worktrees.
     try:
         root, _ = git(cwd, "rev-parse", "--show-toplevel")
         current = Path(os.fsdecode(root.removesuffix(b"\n"))).resolve()
@@ -234,11 +240,10 @@ def inventory(cwd):
 
 def inspect(cwd, path):
     # Re-read membership: stale UI state cannot inspect an unrelated repository.
-    data, _ = git(cwd, "worktree", "list", "--porcelain", "-z")
     target = Path(path).resolve()
-    record = next((r for r in parse_worktrees(data) if Path(r["path"]).resolve() == target), None)
+    record = next((r for r in linked_worktrees(cwd) if Path(r["path"]).resolve() == target), None)
     if record is None:
-        raise GitError("This worktree is no longer registered. Refresh the list.")
+        raise GitError("This path is not a registered linked worktree. Refresh the list.")
     if record.get("bare"):
         return {"files": [], "totalFiles": 0, "diff": "", "truncated": False,
                 "note": "Bare repository: no working files to inspect."}

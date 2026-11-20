@@ -42,6 +42,17 @@ test('safe display, shell quoting, storage and PR labels', () => {
 })
 
 for (const surface of ['terminal', 'desktop'] as const) {
+  test(`${surface}: zero linked worktrees has an empty state and no primary row`, async ($, on) => {
+    stub(on)
+    on('process.run', () => ok({ worktrees: [] }))
+    await $.command.run({ command: 'worktrees', args: '' } as never)
+    const ui = await $.ui.mount({ plugin: 'worktrees', surface, component: 'Pane', requestId: 'worktrees', props: props() })
+    expect(await ui.find({ text: /No linked worktrees yet/ })).toBeDefined()
+    expect(await ui.find({ text: /primary checkout is hidden/ })).toBeDefined()
+    expect(await ui.find({ key: 'row-/work/app' })).toBeUndefined()
+    await ui.unmount()
+  })
+
   test(`${surface}: open, inspect summaries/storage/PR, copy a quoted command, back and refresh`, async ($, on) => {
     stub(on)
     const calls: string[][] = []

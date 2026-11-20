@@ -57,7 +57,7 @@
     {
       "name": "worktrees",
       "source": "./plugins/worktrees",
-      "description": "Browse the current repository's worktrees with brief summaries, local changes, storage usage, and GitHub PR status. /worktrees opens a native pane.",
+      "description": "Browse the current repository's linked worktrees with brief summaries, local changes, storage usage, and GitHub PR status. /worktrees opens a native pane.",
       "category": "productivity",
       "keywords": ["git", "worktrees", "branches", "storage", "pull-requests", "pane", "mod"]
     },

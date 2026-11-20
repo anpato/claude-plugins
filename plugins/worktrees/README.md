@@ -1,9 +1,12 @@
 # worktrees
 
-A Claude Code pane for the current repository's Git worktrees. Run `/worktrees`
+A Claude Code pane for the current repository's linked Git worktrees. Run `/worktrees`
 to see each branch, a brief summary, local changes, allocated storage, and GitHub PR status.
 
-The overview stays scoped to the repository of Claude's current directory. Select a
+The overview stays scoped to the repository of Claude's current directory. The
+primary checkout and bare repository entry are hidden, regardless of their branch
+name. A linked worktree on `main` is still shown. Counts, storage scans and PR
+lookups cover only linked worktrees. Select a
 branch to see its full path, latest commit, upstream, changed files and staged/unstaged
 diff. Copy an open command to start Claude there in another terminal.
 
