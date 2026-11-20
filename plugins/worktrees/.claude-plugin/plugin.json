@@ -1,7 +1,7 @@
 {
   "name": "worktrees",
-  "version": "0.1.0",
-  "description": "Browse this repository's Git worktrees in a native pane, inspect local changes, and copy a command to open Claude in one. /worktrees opens it.",
+  "version": "0.1.1",
+  "description": "Browse this repository's linked Git worktrees in a native pane, inspect local changes, and copy a command to open Claude in one. /worktrees opens it.",
   "author": { "name": "apato" },
   "license": "MIT",
   "keywords": ["git", "worktrees", "branches", "diff", "pane", "mod"],

@@ -15,3 +15,5 @@
 - 15:14 frame-changed: Changed “Worktrees” (claude)
 - 15:14 spec-changed: Changed the spec “Worktree viewer” (claude)
 - 15:18 spec-approved: Approved the spec “Worktree viewer”, version 1 (owner)
+- 15:20 copied: Copied to the repo (claude) · ac1178344138651f228bf0c6d0bc03c99502e761
+- 15:29 spec-changed: Changed the spec “Worktree viewer” (claude)

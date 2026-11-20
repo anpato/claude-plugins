@@ -168,7 +168,7 @@ export const register: Register = on => {
               await patch($, () => ({ query: value, page: 0 }))
               await focusOn($, 'search')
             }} />
-            <Text dimColor>{rows.length} of {v.worktrees.length} worktrees · 1–9 inspect</Text>
+            <Text dimColor>{rows.length} of {v.worktrees.length} linked worktree{v.worktrees.length === 1 ? '' : 's'} · 1–9 inspect</Text>
             {displayed.map((row, i) => <Box key={`box-${row.path}`} flexDirection="column" marginTop={1}>
               <Box key={`header-${row.path}`} flexDirection={badgeFits(width, branchLabel(row) + (row.isCurrent ? ' · current' : ''), prLabel(row)) ? 'row' : 'column'} justifyContent="space-between" columnGap={1}>
                 <Button key={`row-${row.path}`} plain hotkey={String(i + 1)} autoFocus={i === 0 ? true : undefined}
@@ -181,8 +181,8 @@ export const register: Register = on => {
               <Text dimColor>Storage: {storageLabel(row)}</Text>
               {row.error && <Text wrap="truncate-end">{fit(safeText(row.error), width)}</Text>}
             </Box>)}
-            {rows.length === 0 && <Text wrap="wrap">{v.query ? 'No matching worktrees. Try another branch name or path.' : 'No registered worktrees.'}</Text>}
-            {v.worktrees.length === 1 && rows.length === 1 && <Text dimColor wrap="wrap">Only this worktree. Additional worktrees will appear after refresh.</Text>}
+            {rows.length === 0 && <Text wrap="wrap">{v.query ? 'No matching worktrees. Try another branch name or path.' : 'No linked worktrees yet. The primary checkout is hidden.'}</Text>}
+            {v.worktrees.length === 1 && rows.length === 1 && <Text dimColor wrap="wrap">1 linked worktree. Additional worktrees will appear after refresh.</Text>}
             <Box marginTop={1} gap={1} flexWrap="wrap">
               <Button key="search" plain hotkey="s" label="search" onPress={() => focusOn($, 'query')} />
               {v.query !== '' && <Button key="clear" plain hotkey="a" label="clear filter" onPress={() => patch($, () => ({ query: '', page: 0 }))} />}
